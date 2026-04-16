@@ -1,12 +1,7 @@
-{
-  "name": "daiho-backend",
-  "version": "1.0.0",
-  "main": "server.js",
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "pg": "^8.11.0",
-    "bcrypt": "^5.1.0",
-    "dotenv": "^16.3.1"
-  }
-}
+import pg from "pg";
+const { Pool } = pg;
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
