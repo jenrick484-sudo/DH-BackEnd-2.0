@@ -3,3 +3,6 @@ CREATE TABLE users (
     username VARCHAR(50) UNIQUE NOT NULL,
     password VARCHAR(100) NOT NULL
 );
+
+INSERT INTO users (username, password)
+VALUES ('DaihoName', 'DaihoPass');
