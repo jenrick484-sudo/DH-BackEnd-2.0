@@ -1,39 +1,23 @@
 const express = require("express");
-const router = express.Router();
-const pool = require("../db");
+const cors = require("cors");
+const bodyParser = require("body-parser");
 
-/* ADD SALE */
-router.post("/", async (req, res) => {
-  const { item_id, quantity, sale_date } = req.body;
+const app = express();
 
-  const itemRes = await pool.query("SELECT * FROM items WHERE id=$1", [item_id]);
-  const item = itemRes.rows[0];
+app.use(cors());
+app.use(bodyParser.json());
 
-  const sale_amount = item.price * quantity;
-  const investment_amount = item.investment * quantity;
-  const profit = sale_amount - investment_amount;
+const itemsRoutes = require("./routes/items");
+const salesRoutes = require("./routes/sales");
+const dashboardRoutes = require("./routes/dashboard");
 
-  await pool.query(
-    `INSERT INTO sales (item_id, quantity, sale_amount, investment_amount, profit, sale_date)
-     VALUES ($1,$2,$3,$4,$5,$6)`,
-    [item_id, quantity, sale_amount, investment_amount, profit, sale_date]
-  );
+app.use("/api/items", itemsRoutes);
+app.use("/api/sales", salesRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 
-  await pool.query("UPDATE items SET stock = stock - $1 WHERE id=$2", [quantity, item_id]);
-
-  res.json({ profit });
+app.get("/", (req, res) => {
+  res.send("Daiho Backend Running");
 });
 
-/* GET SALES */
-router.get("/", async (req, res) => {
-  const result = await pool.query(`
-    SELECT sales.*, items.item_name
-    FROM sales
-    JOIN items ON items.id = sales.item_id
-    ORDER BY sales.id DESC
-  `);
-
-  res.json(result.rows);
-});
-
-module.exports = router;
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log("Server running"));
