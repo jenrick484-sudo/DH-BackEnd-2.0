@@ -8,19 +8,21 @@ const app = express();
 app.use(cors({
     origin: "*"
 }));
+
 app.use(express.json());
 
-// REGISTER USER (for setup)
+// REGISTER
 app.post("/register", async (req, res) => {
     const { username, password } = req.body;
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-
     try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+
         await pool.query(
             "INSERT INTO users (username, password) VALUES ($1, $2)",
             [username, hashedPassword]
         );
+
         res.json({ message: "User created" });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -41,12 +43,12 @@ app.post("/login", async (req, res) => {
             return res.status(400).json({ message: "User not found" });
         }
 
-        const validPassword = await bcrypt.compare(
+        const valid = await bcrypt.compare(
             password,
             user.rows[0].password
         );
 
-        if (!validPassword) {
+        if (!valid) {
             return res.status(400).json({ message: "Invalid password" });
         }
 
@@ -57,6 +59,9 @@ app.post("/login", async (req, res) => {
     }
 });
 
-app.listen(5000, () => {
-    console.log("Server running on port 5000");
+app.get("/", (req, res) => res.send("Sales backend OK"));
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
