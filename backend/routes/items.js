@@ -2,7 +2,9 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 
-// ADD ITEM
+/* =========================
+   ADD ITEM
+========================= */
 router.post("/items", async (req, res) => {
   const { item_name, investment, price, stock } = req.body;
 
@@ -11,17 +13,62 @@ router.post("/items", async (req, res) => {
       "INSERT INTO items (item_name, investment, price, stock) VALUES ($1,$2,$3,$4)",
       [item_name, investment, price, stock]
     );
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET ITEMS (no stock)
+/* =========================
+   GET ITEMS
+========================= */
 router.get("/items", async (req, res) => {
-  const result = await pool.query("SELECT * FROM items");
-  res.json(result.rows);
+  try {
+    const result = await pool.query("SELECT * FROM items ORDER BY id DESC");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
+/* =========================
+   UPDATE ITEM (EDIT)
+========================= */
+router.put("/items/:id", async (req, res) => {
+  const { id } = req.params;
+  const { item_name, investment, price, stock } = req.body;
+
+  try {
+    await pool.query(
+      `UPDATE items 
+       SET item_name=$1, investment=$2, price=$3, stock=$4 
+       WHERE id=$5`,
+      [item_name, investment, price, stock, id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   DELETE ITEM
+========================= */
+router.delete("/items/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await pool.query(
+      "DELETE FROM items WHERE id=$1",
+      [id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
