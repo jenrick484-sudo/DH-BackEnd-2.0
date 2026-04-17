@@ -19,14 +19,9 @@ router.post("/items", async (req, res) => {
 
 // GET ITEMS (no stock)
 router.get("/items", async (req, res) => {
-  const result = await pool.query("SELECT id, item_name, investment, price FROM items");
-  res.json(result.rows);
-});
-
-// GET ITEMS WITH STOCK (for inventory & sales)
-router.get("/items/all", async (req, res) => {
   const result = await pool.query("SELECT * FROM items");
   res.json(result.rows);
 });
+
 
 module.exports = router;
