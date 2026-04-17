@@ -1,28 +1,46 @@
 const express = require("express");
-const cors = require("cors");
-const bodyParser = require("body-parser");
+const router = express.Router();
+const pool = require("../db");
 
-const authRoutes = require("./routes/auth");
-const itemsRoutes = require("./routes/items");
-const salesRoutes = require("./routes/sales");
-const dashboardRoutes = require("./routes/dashboard");
+// ADD SALE
+router.post("/sales", async (req, res) => {
+  const { item_id, qty, date } = req.body;
 
-const app = express();
+  try {
+    const item = await pool.query("SELECT * FROM items WHERE id=$1", [item_id]);
 
-app.use(cors());
-app.use(bodyParser.json());
+    if (item.rows.length === 0) {
+      return res.json({ success: false, message: "Item not found" });
+    }
 
-app.use("/api", authRoutes);
-app.use("/api", itemsRoutes);
-app.use("/api", salesRoutes);
-app.use("/api", dashboardRoutes);
+    if (item.rows[0].stock < qty) {
+      return res.json({ success: false, message: "Not enough stock" });
+    }
 
-app.get("/", (req, res) => {
-  res.send("Daiho Backend Running");
+    await pool.query(
+      "INSERT INTO sales (item_id, qty, date) VALUES ($1,$2,$3)",
+      [item_id, qty, date]
+    );
+
+    await pool.query(
+      "UPDATE items SET stock = stock - $1 WHERE id=$2",
+      [qty, item_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
+// GET SALES
+router.get("/sales", async (req, res) => {
+  const result = await pool.query(`
+    SELECT s.id, i.item_name, s.qty, s.date, (i.price * s.qty) as total
+    FROM sales s
+    JOIN items i ON s.item_id = i.id
+  `);
+  res.json(result.rows);
 });
+
+module.exports = router;
