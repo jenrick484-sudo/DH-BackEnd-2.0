@@ -13,7 +13,9 @@ router.post("/sales", async (req, res) => {
       return res.json({ success: false, message: "Item not found" });
     }
 
-    if (item.rows[0].stock < qty) {
+    const quantity = Number(qty);
+
+    if (item.rows[0].stock < quantity) {
       return res.json({ success: false, message: "Not enough stock" });
     }
 
@@ -24,7 +26,7 @@ router.post("/sales", async (req, res) => {
 
     await pool.query(
       "UPDATE items SET stock = stock - $1 WHERE id=$2",
-      [qty, item_id]
+      [quantity, item_id]
     );
 
     res.json({ success: true });
