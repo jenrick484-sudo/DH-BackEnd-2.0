@@ -1,6 +1,15 @@
 const express = require("express");
 const router = express.Router();
 const pool = require("../db");
+const multer = require("multer");
+const path = require("path");
+
+router.post("/upload", upload.array("images", 6), (req, res) => {
+
+  const files = req.files.map(f => `/uploads/${f.filename}`);
+
+  res.json({ images: files });
+});
 
 /* =========================
    ADD ITEM
@@ -82,20 +91,35 @@ router.get("/items", async (req, res) => {
 ========================= */
 router.put("/items/:id", async (req, res) => {
   const { id } = req.params;
-  const { item_name, investment, price, stock } = req.body;
 
-  try {
-    await pool.query(
-      `UPDATE items 
-       SET item_name=$1, investment=$2, price=$3, stock=$4 
-       WHERE id=$5`,
-      [item_name, investment, price, stock, id]
-    );
+  const {
+    item_name,
+    description,
+    part_no,
+    oem_no,
+    brand,
+    investment,
+    price,
+    stock,
+    images
+  } = req.body;
 
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  await pool.query(
+    `UPDATE items SET 
+      item_name=$1,
+      description=$2,
+      part_no=$3,
+      oem_no=$4,
+      brand=$5,
+      investment=$6,
+      price=$7,
+      stock=$8,
+      images=$9
+     WHERE id=$10`,
+    [item_name, description, part_no, oem_no, brand, investment, price, stock, images, id]
+  );
+
+  res.json({ success: true });
 });
 
 /* =========================
