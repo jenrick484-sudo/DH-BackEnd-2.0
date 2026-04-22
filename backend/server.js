@@ -14,11 +14,10 @@ app.use(cors({
 }));
 app.use(bodyParser.json());
 
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use("/api", authRoutes);
-app.use("/api", itemsRoutes);
-app.use("/api", salesRoutes);
-app.use("/api", dashboardRoutes);
+app.use("/api/items", itemsRoutes);
+app.use("/api/sales", salesRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 
 app.get("/", (req, res) => {
   res.send("Daiho Backend Running");
