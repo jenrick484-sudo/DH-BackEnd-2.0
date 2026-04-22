@@ -5,17 +5,49 @@ const pool = require("../db");
 /* =========================
    ADD ITEM
 ========================= */
-router.post("/items", async (req, res) => {
-  const { item_name, investment, price, stock } = req.body;
+router.put("/items/:id", async (req, res) => {
+  const { id } = req.params;
+
+  const {
+    item_name,
+    description,
+    part_no,
+    oem_no,
+    brand,
+    investment,
+    price,
+    stock
+  } = req.body;
 
   try {
     await pool.query(
-      "INSERT INTO items (item_name, investment, price, stock) VALUES ($1,$2,$3,$4)",
-      [item_name, investment, price, stock]
+      `UPDATE items SET 
+        item_name=$1,
+        description=$2,
+        part_no=$3,
+        oem_no=$4,
+        brand=$5,
+        investment=$6,
+        price=$7,
+        stock=$8
+       WHERE id=$9`,
+      [
+        item_name,
+        description,
+        part_no,
+        oem_no,
+        brand,
+        investment,
+        price,
+        stock,
+        id
+      ]
     );
 
     res.json({ success: true });
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
