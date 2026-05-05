@@ -6,7 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors());            // payagan ang kahit anong frontend origin (sa production, puwedeng higpitan)
+app.use(cors());
 app.use(express.json());
 
 const pool = new Pool({
@@ -14,12 +14,11 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Middleware para sa protected routes
+// Middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.sendStatus(401);
-
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.sendStatus(403);
     req.user = user;
@@ -27,7 +26,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// Awtomatikong gumawa ng tables kung wala pa
+// Initialize tables
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -35,21 +34,39 @@ async function initDB() {
       username VARCHAR(100) UNIQUE NOT NULL,
       password_hash VARCHAR(255) NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS daily_sales (
+    CREATE TABLE IF NOT EXISTS items (
       id SERIAL PRIMARY KEY,
-      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      price DECIMAL(10,2) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS inventory (
+      item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS sales (
+      id SERIAL PRIMARY KEY,
+      sale_date DATE NOT NULL DEFAULT CURRENT_DATE,
       total_amount DECIMAL(10,2) NOT NULL,
-      notes TEXT,
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS sale_items (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER REFERENCES sales(id) ON DELETE CASCADE,
+      item_id INTEGER REFERENCES items(id),
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      unit_price DECIMAL(10,2) NOT NULL,
+      line_total DECIMAL(10,2) NOT NULL
+    );
   `);
-  console.log('Database tables ready.');
+  console.log('All tables ready');
 }
 initDB();
 
-// ----- ROUTES -----
-
+// ---- Authentication routes ----
 // Register (para makagawa ng unang admin account)
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
@@ -85,35 +102,198 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Magdagdag ng daily sales (protected)
-app.post('/api/sales', authenticateToken, async (req, res) => {
-  const { date, total_amount, notes } = req.body;
-  if (!total_amount) return res.status(400).json({ error: 'Total amount required' });
+// ---- Item routes ----
+app.get('/api/items', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'INSERT INTO daily_sales (date, total_amount, notes, created_by) VALUES ($1, $2, $3, $4) RETURNING *',
-      [date || new Date().toISOString().slice(0, 10), total_amount, notes, req.user.id]
-    );
-    res.status(201).json(result.rows[0]);
+    const result = await pool.query('SELECT * FROM items ORDER BY name');
+    res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to add sales' });
+    res.status(500).json({ error: 'Failed to fetch items' });
   }
 });
 
-// Kunin lahat ng sales (protected)
-app.get('/api/sales', authenticateToken, async (req, res) => {
+app.post('/api/items', authenticateToken, async (req, res) => {
+  const { name, description, price, initial_stock } = req.body;
+  if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const itemResult = await client.query(
+      'INSERT INTO items (name, description, price) VALUES ($1, $2, $3) RETURNING *',
+      [name, description, price]
+    );
+    const newItem = itemResult.rows[0];
+    await client.query(
+      'INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)',
+      [newItem.id, initial_stock || 0]
+    );
+    await client.query('COMMIT');
+    res.status(201).json(newItem);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to add item' });
+  } finally {
+    client.release();
+  }
+});
+
+// ---- Inventory routes ----
+app.get('/api/inventory', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT ds.*, u.username 
-       FROM daily_sales ds 
-       JOIN users u ON ds.created_by = u.id 
-       ORDER BY ds.date DESC, ds.created_at DESC`
+      `SELECT i.id, i.name, i.price, inv.quantity
+       FROM items i
+       JOIN inventory inv ON i.id = inv.item_id
+       ORDER BY i.name`
     );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch inventory' });
+  }
+});
+
+app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
+  const { itemId } = req.params;
+  const { quantity } = req.body;
+  if (quantity == null || quantity < 0) return res.status(400).json({ error: 'Invalid quantity' });
+  try {
+    await pool.query(
+      'UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2',
+      [quantity, itemId]
+    );
+    res.json({ message: 'Inventory updated' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update inventory' });
+  }
+});
+
+// ---- Sales (with line items) ----
+app.post('/api/sales', authenticateToken, async (req, res) => {
+  const { items } = req.body; // array of { item_id, quantity }
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Items array required' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let total = 0;
+    const saleItems = [];
+    for (const line of items) {
+      const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
+      if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
+      const item = itemRes.rows[0];
+      const unitPrice = item.price;
+      const lineTotal = unitPrice * line.quantity;
+      total += lineTotal;
+      saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
+      // Deduct inventory
+      const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
+      if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
+        throw new Error(`Insufficient stock for item "${item.name}"`);
+      }
+      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
+    }
+    // Insert sales header
+    const saleResult = await client.query(
+      'INSERT INTO sales (total_amount, created_by) VALUES ($1, $2) RETURNING id',
+      [total, req.user.id]
+    );
+    const saleId = saleResult.rows[0].id;
+    // Insert sale_items
+    for (const si of saleItems) {
+      await client.query(
+        'INSERT INTO sale_items (sale_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
+        [saleId, si.item_id, si.quantity, si.unit_price, si.line_total]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ sale_id: saleId, total_amount: total });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get all sales headers with line items (optional)
+app.get('/api/sales', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT s.*, u.username,
+             json_agg(json_build_object(
+               'item_name', i.name,
+               'quantity', si.quantity,
+               'unit_price', si.unit_price,
+               'line_total', si.line_total
+             )) as line_items
+      FROM sales s
+      JOIN users u ON s.created_by = u.id
+      LEFT JOIN sale_items si ON s.id = si.sale_id
+      LEFT JOIN items i ON si.item_id = i.id
+      GROUP BY s.id, u.username
+      ORDER BY s.created_at DESC
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch sales' });
   }
 });
 
+// ---- Reports ----
+app.get('/api/sales/report', authenticateToken, async (req, res) => {
+  const { year, month, day } = req.query;
+  let where = '';
+  const params = [];
+  if (year) {
+    params.push(year);
+    where += ` AND EXTRACT(YEAR FROM s.sale_date) = $${params.length}`;
+  }
+  if (month) {
+    params.push(month);
+    where += ` AND EXTRACT(MONTH FROM s.sale_date) = $${params.length}`;
+  }
+  if (day) {
+    params.push(day);
+    where += ` AND EXTRACT(DAY FROM s.sale_date) = $${params.length}`;
+  }
+  try {
+    const result = await pool.query(`
+      SELECT s.sale_date, SUM(s.total_amount) as daily_total, COUNT(s.id) as transaction_count
+      FROM sales s
+      WHERE 1=1 ${where}
+      GROUP BY s.sale_date
+      ORDER BY s.sale_date
+    `, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+});
+
+// Dashboard summary
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const salesToday = await pool.query(
+      'SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1',
+      [today]
+    );
+    const itemCount = await pool.query('SELECT COUNT(*) as count FROM items');
+    const inventoryValue = await pool.query(`
+      SELECT COALESCE(SUM(i.price * inv.quantity), 0) as value
+      FROM inventory inv
+      JOIN items i ON inv.item_id = i.id
+    `);
+    res.json({
+      today_sales: parseFloat(salesToday.rows[0].total),
+      total_items: parseInt(itemCount.rows[0].count),
+      inventory_value: parseFloat(inventoryValue.rows[0].value)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
