@@ -268,7 +268,7 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
       const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
       if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
       const item = itemRes.rows[0];
-      const unitPrice = item.price;
+      const unitPrice = line.unit_price || item.price;   // kung may ipinadalang presyo, gamitin iyon
       const lineTotal = unitPrice * line.quantity;
       total += lineTotal;
       saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
@@ -308,6 +308,7 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
     const result = await pool.query(`
       SELECT s.*, u.username,
              json_agg(json_build_object(
+               'id', si.id,
                'item_name', i.name,
                'quantity', si.quantity,
                'unit_price', si.unit_price,
@@ -323,6 +324,72 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch sales' });
+  }
+});
+
+// I-update ang isang line item
+app.put('/api/sales/item/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { quantity, unit_price } = req.body;
+  if (!quantity || !unit_price) return res.status(400).json({ error: 'Missing fields' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Hanapin ang dating line item para malaman ang dating quantity
+    const old = await client.query('SELECT * FROM sale_items WHERE id = $1', [id]);
+    if (old.rows.length === 0) throw new Error('Line item not found');
+    const { item_id, quantity: old_qty } = old.rows[0];
+    // Ibalik ang dating stock
+    await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2', [old_qty, item_id]);
+    // Suriin kung sapat ang bagong stock
+    const inv = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item_id]);
+    if (inv.rows[0].quantity < quantity) throw new Error('Insufficient stock');
+    // Bawasan ang bagong stock
+    await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [quantity, item_id]);
+    // I-update ang line item
+    const new_total = unit_price * quantity;
+    await client.query(
+      'UPDATE sale_items SET quantity = $1, unit_price = $2, line_total = $3 WHERE id = $4',
+      [quantity, unit_price, new_total, id]
+    );
+    // I-update ang total_amount ng parent sales
+    const parent = await client.query('SELECT sale_id FROM sale_items WHERE id = $1', [id]);
+    const saleId = parent.rows[0].sale_id;
+    const sumRes = await client.query('SELECT SUM(line_total) as total FROM sale_items WHERE sale_id = $1', [saleId]);
+    await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2', [sumRes.rows[0].total, saleId]);
+    await client.query('COMMIT');
+    res.json({ message: 'Updated' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Burahin ang isang line item
+app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const old = await client.query('SELECT * FROM sale_items WHERE id = $1', [id]);
+    if (old.rows.length === 0) throw new Error('Line item not found');
+    const { item_id, quantity, sale_id } = old.rows[0];
+    // Ibalik ang stock
+    await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2', [quantity, item_id]);
+    // Burahin ang line item
+    await client.query('DELETE FROM sale_items WHERE id = $1', [id]);
+    // I-update ang total ng parent sales
+    const sumRes = await client.query('SELECT COALESCE(SUM(line_total),0) as total FROM sale_items WHERE sale_id = $1', [sale_id]);
+    await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2', [sumRes.rows[0].total, sale_id]);
+    await client.query('COMMIT');
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
