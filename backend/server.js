@@ -307,13 +307,15 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT s.*, u.username,
-             json_agg(json_build_object(
-               'id', si.id,
-               'item_name', i.name,
-               'quantity', si.quantity,
-               'unit_price', si.unit_price,
-               'line_total', si.line_total
-             )) as line_items
+             COALESCE(json_agg(
+               json_build_object(
+                 'id', si.id,
+                 'item_name', i.name,
+                 'quantity', si.quantity,
+                 'unit_price', si.unit_price,
+                 'line_total', si.line_total
+               )
+             ) FILTER (WHERE si.id IS NOT NULL), '[]') as line_items
       FROM sales s
       JOIN users u ON s.created_by = u.id
       LEFT JOIN sale_items si ON s.id = si.sale_id
@@ -370,11 +372,15 @@ app.put('/api/sales/item/:id', authenticateToken, async (req, res) => {
 // Burahin ang isang line item
 app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  console.log('DELETE request for sale_item id:', id);   // <-- idagdag
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const old = await client.query('SELECT * FROM sale_items WHERE id = $1', [id]);
-    if (old.rows.length === 0) throw new Error('Line item not found');
+    if (old.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Line item not found' });
+    }
     const { item_id, quantity, sale_id } = old.rows[0];
     // Ibalik ang stock
     await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2', [quantity, item_id]);
@@ -384,9 +390,11 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
     const sumRes = await client.query('SELECT COALESCE(SUM(line_total),0) as total FROM sale_items WHERE sale_id = $1', [sale_id]);
     await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2', [sumRes.rows[0].total, sale_id]);
     await client.query('COMMIT');
+    console.log('Successfully deleted sale_item id:', id);   // <-- idagdag
     res.json({ message: 'Deleted' });
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error('Delete error:', err);   // <-- idagdag
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
