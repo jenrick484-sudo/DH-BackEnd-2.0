@@ -38,7 +38,11 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
       description TEXT,
+      brand VARCHAR(255),
+      investment DECIMAL(10,2),
       price DECIMAL(10,2) NOT NULL,
+      part_number VARCHAR(100),
+      oem_number VARCHAR(100),
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS inventory (
@@ -103,24 +107,32 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ---- Item routes ----
+// Kunin lahat ng items (kasama ang current stock mula sa inventory)
 app.get('/api/items', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM items ORDER BY name');
+    const result = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      ORDER BY i.name
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch items' });
   }
 });
 
+// Magdagdag ng bagong item (kasama ang initial stock)
 app.post('/api/items', authenticateToken, async (req, res) => {
-  const { name, description, price, initial_stock } = req.body;
+  const { name, description, brand, investment, price, part_number, oem_number, initial_stock } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const itemResult = await client.query(
-      'INSERT INTO items (name, description, price) VALUES ($1, $2, $3) RETURNING *',
-      [name, description, price]
+      `INSERT INTO items (name, description, brand, investment, price, part_number, oem_number)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name, description, brand, investment, price, part_number, oem_number]
     );
     const newItem = itemResult.rows[0];
     await client.query(
@@ -128,10 +140,47 @@ app.post('/api/items', authenticateToken, async (req, res) => {
       [newItem.id, initial_stock || 0]
     );
     await client.query('COMMIT');
-    res.status(201).json(newItem);
+    res.status(201).json({ ...newItem, stock: initial_stock || 0 });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: 'Failed to add item' });
+  } finally {
+    client.release();
+  }
+});
+
+// I-update ang item (details at stock)
+app.put('/api/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { name, description, brand, investment, price, part_number, oem_number, stock } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Update item fields
+    await client.query(
+      `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7
+       WHERE id=$8`,
+      [name, description, brand, investment, price, part_number, oem_number, id]
+    );
+    // Update stock kung ibinigay
+    if (stock !== undefined) {
+      await client.query(
+        'UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2',
+        [stock, id]
+      );
+    }
+    await client.query('COMMIT');
+    // Ibalik ang updated item kasama ang stock
+    const updated = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      WHERE i.id = $1
+    `, [id]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to update item' });
   } finally {
     client.release();
   }
