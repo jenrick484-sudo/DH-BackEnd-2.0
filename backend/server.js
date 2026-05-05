@@ -119,17 +119,147 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ---- ITEM ROUTES (pareho sa dati) ----
-app.get('/api/items', authenticateToken, async (req, res) => { /* ... same as before ... */ });
-app.post('/api/items', authenticateToken, async (req, res) => { /* ... same as before ... */ });
-app.put('/api/items/:id', authenticateToken, async (req, res) => { /* ... same as before ... */ });
-app.get('/api/items/:id', authenticateToken, async (req, res) => { /* ... same as before ... */ });
+// ---- Item routes ----
+// Kunin lahat ng items (kasama ang current stock mula sa inventory)
+app.get('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      ORDER BY i.name
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch items' });
+  }
+});
 
-// ---- INVENTORY ROUTES (same as before) ----
-app.get('/api/inventory', authenticateToken, async (req, res) => { /* ... same as before ... */ });
-app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => { /* ... same as before ... */ });
+// Magdagdag ng bagong item (kasama ang initial stock)
+app.post('/api/items', authenticateToken, async (req, res) => {
+  const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images } = req.body;
+  if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const itemResult = await client.query(
+      `INSERT INTO items (name, description, brand, investment, price, part_number, oem_number)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name, description, brand, investment, price, part_number, oem_number]
+    );
+    const newItem = itemResult.rows[0];
+    await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
+    // Ipasok ang mga larawan (kung mayroon)
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {  // hanggang 6 lang
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [newItem.id, imgBase64]);
+        }
+      }
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ ...newItem, stock: initial_stock || 0, images: [] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to add item' });
+  } finally {
+    client.release();
+  }
+});
 
-// ---- SALES (binago ang insert – gamit ang totoong req.user.id) ----
+// I-update ang item (details at stock)
+app.put('/api/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { name, description, brand, investment, price, part_number, oem_number, stock, images } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Update item details
+    await client.query(
+      `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7
+       WHERE id=$8`,
+      [name, description, brand, investment, price, part_number, oem_number, id]
+    );
+    // Update stock
+    await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
+    // Palitan ang mga imahe: burahin lahat, saka ipasok ang bago
+    await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [id, imgBase64]);
+        }
+      }
+    }
+    await client.query('COMMIT');
+    const updated = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      WHERE i.id = $1
+    `, [id]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to update item' });
+  } finally {
+    client.release();
+  }
+});
+
+// Kunin ang isang item (kasama ang mga larawan)
+app.get('/api/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const itemResult = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      WHERE i.id = $1
+    `, [id]);
+    if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    const item = itemResult.rows[0];
+    const imagesResult = await pool.query(
+      'SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id',
+      [id]
+    );
+    item.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch item' });
+  }
+});
+
+// ---- Inventory routes ----
+app.get('/api/inventory', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT i.id, i.name, i.price, inv.quantity
+       FROM items i
+       JOIN inventory inv ON i.id = inv.item_id
+       ORDER BY i.name`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch inventory' });
+  }
+});
+
+app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
+  const { itemId } = req.params;
+  const { quantity } = req.body;
+  if (quantity == null || quantity < 0) return res.status(400).json({ error: 'Invalid quantity' });
+  try {
+    await pool.query(
+      'UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2',
+      [quantity, itemId]
+    );
+    res.json({ message: 'Inventory updated' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update inventory' });
+  }
+});
+
 app.post('/api/sales', authenticateToken, async (req, res) => {
   const { items } = req.body; // array of { item_id, quantity, unit_price? }
   if (!items || !Array.isArray(items) || items.length === 0) {
@@ -268,11 +398,60 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- REPORTS (same as before) ----
-app.get('/api/sales/report', authenticateToken, async (req, res) => { /* ... */ });
+// ---- Reports ----
+app.get('/api/sales/report', authenticateToken, async (req, res) => {
+  const { year, month, day } = req.query;
+  let where = '';
+  const params = [];
+  if (year) {
+    params.push(year);
+    where += ` AND EXTRACT(YEAR FROM s.sale_date) = $${params.length}`;
+  }
+  if (month) {
+    params.push(month);
+    where += ` AND EXTRACT(MONTH FROM s.sale_date) = $${params.length}`;
+  }
+  if (day) {
+    params.push(day);
+    where += ` AND EXTRACT(DAY FROM s.sale_date) = $${params.length}`;
+  }
+  try {
+    const result = await pool.query(`
+      SELECT s.sale_date, SUM(s.total_amount) as daily_total, COUNT(s.id) as transaction_count
+      FROM sales s
+      WHERE 1=1 ${where}
+      GROUP BY s.sale_date
+      ORDER BY s.sale_date
+    `, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+});
 
-// ---- DASHBOARD ----
-app.get('/api/dashboard', authenticateToken, async (req, res) => { /* ... */ });
+// Dashboard summary
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const salesToday = await pool.query(
+      'SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1',
+      [today]
+    );
+    const itemCount = await pool.query('SELECT COUNT(*) as count FROM items');
+    const inventoryValue = await pool.query(`
+      SELECT COALESCE(SUM(i.price * inv.quantity), 0) as value
+      FROM inventory inv
+      JOIN items i ON inv.item_id = i.id
+    `);
+    res.json({
+      today_sales: parseFloat(salesToday.rows[0].total),
+      total_items: parseInt(itemCount.rows[0].count),
+      inventory_value: parseFloat(inventoryValue.rows[0].value)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
