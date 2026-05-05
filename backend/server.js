@@ -7,7 +7,7 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -49,6 +49,12 @@ async function initDB() {
       item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
       quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
       updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS item_images (
+      id SERIAL PRIMARY KEY,
+      item_id INTEGER REFERENCES items(id) ON DELETE CASCADE,
+      image_data TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS sales (
       id SERIAL PRIMARY KEY,
@@ -124,7 +130,7 @@ app.get('/api/items', authenticateToken, async (req, res) => {
 
 // Magdagdag ng bagong item (kasama ang initial stock)
 app.post('/api/items', authenticateToken, async (req, res) => {
-  const { name, description, brand, investment, price, part_number, oem_number, initial_stock } = req.body;
+  const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
   const client = await pool.connect();
   try {
@@ -135,12 +141,17 @@ app.post('/api/items', authenticateToken, async (req, res) => {
       [name, description, brand, investment, price, part_number, oem_number]
     );
     const newItem = itemResult.rows[0];
-    await client.query(
-      'INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)',
-      [newItem.id, initial_stock || 0]
-    );
+    await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
+    // Ipasok ang mga larawan (kung mayroon)
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {  // hanggang 6 lang
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [newItem.id, imgBase64]);
+        }
+      }
+    }
     await client.query('COMMIT');
-    res.status(201).json({ ...newItem, stock: initial_stock || 0 });
+    res.status(201).json({ ...newItem, stock: initial_stock || 0, images: [] });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: 'Failed to add item' });
@@ -152,25 +163,28 @@ app.post('/api/items', authenticateToken, async (req, res) => {
 // I-update ang item (details at stock)
 app.put('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { name, description, brand, investment, price, part_number, oem_number, stock } = req.body;
+  const { name, description, brand, investment, price, part_number, oem_number, stock, images } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Update item fields
+    // Update item details
     await client.query(
       `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7
        WHERE id=$8`,
       [name, description, brand, investment, price, part_number, oem_number, id]
     );
-    // Update stock kung ibinigay
-    if (stock !== undefined) {
-      await client.query(
-        'UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2',
-        [stock, id]
-      );
+    // Update stock
+    await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
+    // Palitan ang mga imahe: burahin lahat, saka ipasok ang bago
+    await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [id, imgBase64]);
+        }
+      }
     }
     await client.query('COMMIT');
-    // Ibalik ang updated item kasama ang stock
     const updated = await pool.query(`
       SELECT i.*, COALESCE(inv.quantity, 0) as stock
       FROM items i
@@ -183,6 +197,29 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to update item' });
   } finally {
     client.release();
+  }
+});
+
+// Kunin ang isang item (kasama ang mga larawan)
+app.get('/api/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const itemResult = await pool.query(`
+      SELECT i.*, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      WHERE i.id = $1
+    `, [id]);
+    if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    const item = itemResult.rows[0];
+    const imagesResult = await pool.query(
+      'SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id',
+      [id]
+    );
+    item.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch item' });
   }
 });
 
