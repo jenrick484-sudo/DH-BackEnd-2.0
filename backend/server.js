@@ -307,13 +307,15 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT s.*, u.username,
-             json_agg(json_build_object(
-               'id', si.id,
-               'item_name', i.name,
-               'quantity', si.quantity,
-               'unit_price', si.unit_price,
-               'line_total', si.line_total
-             )) as line_items
+             COALESCE(json_agg(
+               json_build_object(
+                 'id', si.id,
+                 'item_name', i.name,
+                 'quantity', si.quantity,
+                 'unit_price', si.unit_price,
+                 'line_total', si.line_total
+               )
+             ) FILTER (WHERE si.id IS NOT NULL), '[]') as line_items
       FROM sales s
       JOIN users u ON s.created_by = u.id
       LEFT JOIN sale_items si ON s.id = si.sale_id
