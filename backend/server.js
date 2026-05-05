@@ -369,25 +369,47 @@ app.put('/api/sales/item/:id', authenticateToken, async (req, res) => {
 // ---- DELETE A LINE ITEM (permanente) ----
 app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  console.log('DELETE sale_item id:', id);   // log para makita sa Render
+  console.log('DELETE sale_item id:', id);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Hanapin ang line item
     const old = await client.query('SELECT * FROM sale_items WHERE id = $1', [id]);
     if (old.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Line item not found' });
     }
+
     const { item_id, quantity, sale_id } = old.rows[0];
+
     // Ibalik ang stock
-    await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2', [quantity, item_id]);
+    await client.query(
+      'UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2',
+      [quantity, item_id]
+    );
+
     // Burahin ang line item
     await client.query('DELETE FROM sale_items WHERE id = $1', [id]);
-    // I-update ang total ng parent sales
-    const sumRes = await client.query('SELECT COALESCE(SUM(line_total),0) as total FROM sale_items WHERE sale_id = $1', [sale_id]);
-    await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2', [sumRes.rows[0].total, sale_id]);
+
+    // Tingnan kung may natitirang ibang line items
+    const remaining = await client.query(
+      'SELECT COALESCE(SUM(line_total), 0) as total, COUNT(*) as cnt FROM sale_items WHERE sale_id = $1',
+      [sale_id]
+    );
+
+    if (remaining.rows[0].cnt === 0) {
+      // Wala nang item – burahin ang buong sales record
+      await client.query('DELETE FROM sales WHERE id = $1', [sale_id]);
+      console.log(`Sales ${sale_id} deleted (no items left)`);
+    } else {
+      // May natira pa, i-update lang ang total
+      await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2',
+        [remaining.rows[0].total, sale_id]);
+    }
+
     await client.query('COMMIT');
-    console.log('Successfully deleted sale_item id:', id);
+    console.log('Delete success for sale_item id:', id);
     res.json({ message: 'Deleted' });
   } catch (err) {
     await client.query('ROLLBACK');
