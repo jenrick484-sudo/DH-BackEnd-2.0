@@ -19,19 +19,9 @@ function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      console.error('JWT verify error:', err);
-      return res.sendStatus(403);
-    }
-    // Siguraduhing may id at ito ay valid number
-    if (!decoded || !decoded.id) {
-      console.error('JWT payload missing id:', decoded);
-      return res.sendStatus(403);
-    }
-    req.user = { id: Number(decoded.id), username: decoded.username };
-    console.log('Authenticated user:', req.user);   // log
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
     next();
   });
 }
@@ -264,29 +254,51 @@ app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
 });
 
 // ---- Sales (with line items) ----
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
+app.post('/api/sales', authenticateToken, async (req, res) => {
+  const { items } = req.body; // array of { item_id, quantity }
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Items array required' });
+  }
+  const client = await pool.connect();
   try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    const user = result.rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
-    // Tiyaking number ang user.id
-    const userId = Number(user.id);
-    console.log('Logging in user id:', userId);   // <-- pansamantalang log
-
-    const token = jwt.sign(
-      { id: userId, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '1d' }
+    await client.query('BEGIN');
+    let total = 0;
+    const saleItems = [];
+    for (const line of items) {
+      const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
+      if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
+      const item = itemRes.rows[0];
+      const unitPrice = line.unit_price || item.price;   // kung may ipinadalang presyo, gamitin iyon
+      const lineTotal = unitPrice * line.quantity;
+      total += lineTotal;
+      saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
+      // Deduct inventory
+      const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
+      if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
+        throw new Error(`Insufficient stock for item "${item.name}"`);
+      }
+      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
+    }
+    // Insert sales header
+    const saleResult = await client.query(
+      'INSERT INTO sales (total_amount, created_by) VALUES ($1, $2) RETURNING id',
+      [total, req.user.id]
     );
-    res.json({ token, user: { id: userId, username: user.username } });
+    const saleId = saleResult.rows[0].id;
+    // Insert sale_items
+    for (const si of saleItems) {
+      await client.query(
+        'INSERT INTO sale_items (sale_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
+        [saleId, si.item_id, si.quantity, si.unit_price, si.line_total]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ sale_id: saleId, total_amount: total });
   } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Server error' });
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -389,11 +401,6 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   }
 });
 
-const saleResult = await client.query(
-  'INSERT INTO sales (total_amount, created_by) VALUES ($1, $2) RETURNING id',
-  [total, req.user.id]
-);
-
 // ---- Reports ----
 app.get('/api/sales/report', authenticateToken, async (req, res) => {
   const { year, month, day } = req.query;
@@ -450,4 +457,4 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server on port ${PORT}`));  
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
