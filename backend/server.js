@@ -422,33 +422,87 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
 });
 
 // ---- Reports ----
-app.get('/api/sales/report', authenticateToken, async (req, res) => {
-  const { year, month, day } = req.query;
-  let where = '';
-  const params = [];
-  if (year) {
-    params.push(year);
-    where += ` AND EXTRACT(YEAR FROM s.sale_date) = $${params.length}`;
-  }
-  if (month) {
-    params.push(month);
-    where += ` AND EXTRACT(MONTH FROM s.sale_date) = $${params.length}`;
-  }
-  if (day) {
-    params.push(day);
-    where += ` AND EXTRACT(DAY FROM s.sale_date) = $${params.length}`;
-  }
+// ---- REPORTS (bagong endpoints) ----
+
+// Yearly: 12 buwan
+app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
+  const { year } = req.query;
+  if (!year) return res.status(400).json({ error: 'Year required' });
   try {
     const result = await pool.query(`
-      SELECT s.sale_date, SUM(s.total_amount) as daily_total, COUNT(s.id) as transaction_count
-      FROM sales s
-      WHERE 1=1 ${where}
-      GROUP BY s.sale_date
-      ORDER BY s.sale_date
-    `, params);
+      SELECT EXTRACT(MONTH FROM sale_date) as month,
+             COALESCE(SUM(total_amount), 0) as total_sales,
+             COUNT(id) as transaction_count
+      FROM sales
+      WHERE EXTRACT(YEAR FROM sale_date) = $1
+      GROUP BY month
+      ORDER BY month
+    `, [year]);
+    // Ipunan ang 12 buwan (kung may buwang walang benta, 0)
+    const monthly = Array.from({ length: 12 }, (_, i) => {
+      const existing = result.rows.find(r => parseInt(r.month) === i + 1);
+      return {
+        month: i + 1,
+        total_sales: existing ? parseFloat(existing.total_sales) : 0,
+        transaction_count: existing ? parseInt(existing.transaction_count) : 0
+      };
+    });
+    res.json(monthly);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch yearly report' });
+  }
+});
+
+// Monthly: lahat ng araw sa isang buwan
+app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
+  const { year, month } = req.query;
+  if (!year || !month) return res.status(400).json({ error: 'Year and month required' });
+  try {
+    // Kunin ang bilang ng araw sa buwan na iyon
+    const daysInMonth = new Date(year, month, 0).getDate(); // month ay 1-indexed, pero sa JS Date, 0 ang last day
+    const result = await pool.query(`
+      SELECT EXTRACT(DAY FROM sale_date) as day,
+             COALESCE(SUM(total_amount), 0) as total_sales,
+             COUNT(id) as transaction_count
+      FROM sales
+      WHERE EXTRACT(YEAR FROM sale_date) = $1 AND EXTRACT(MONTH FROM sale_date) = $2
+      GROUP BY day
+      ORDER BY day
+    `, [year, month]);
+    const daily = Array.from({ length: daysInMonth }, (_, i) => {
+      const day = i + 1;
+      const existing = result.rows.find(r => parseInt(r.day) === day);
+      return {
+        day,
+        total_sales: existing ? parseFloat(existing.total_sales) : 0,
+        transaction_count: existing ? parseInt(existing.transaction_count) : 0
+      };
+    });
+    res.json(daily);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch monthly report' });
+  }
+});
+
+// Daily: mga line item ng isang araw
+app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
+  const { year, month, day } = req.query;
+  if (!year || !month || !day) return res.status(400).json({ error: 'Year, month, day required' });
+  try {
+    const result = await pool.query(`
+      SELECT si.id, i.name as item_name, i.description, i.brand, i.part_number, i.oem_number,
+             si.quantity, si.unit_price, si.line_total
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      JOIN items i ON si.item_id = i.id
+      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
+        AND EXTRACT(MONTH FROM s.sale_date) = $2
+        AND EXTRACT(DAY FROM s.sale_date) = $3
+      ORDER BY s.created_at
+    `, [year, month, day]);
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to generate report' });
+    res.status(500).json({ error: 'Failed to fetch daily report' });
   }
 });
 
