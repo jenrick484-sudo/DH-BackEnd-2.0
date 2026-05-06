@@ -233,12 +233,13 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
 // ---- Inventory routes ----
 app.get('/api/inventory', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT i.id, i.name, i.price, inv.quantity
-       FROM items i
-       JOIN inventory inv ON i.id = inv.item_id
-       ORDER BY i.name`
-    );
+    const result = await pool.query(`
+      SELECT i.id, i.name, i.description, i.brand, i.investment, i.price,
+             i.part_number, i.oem_number, COALESCE(inv.quantity, 0) as stock
+      FROM items i
+      LEFT JOIN inventory inv ON i.id = inv.item_id
+      ORDER BY i.name
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch inventory' });
