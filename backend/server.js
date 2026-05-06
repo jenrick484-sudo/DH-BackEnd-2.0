@@ -422,9 +422,6 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
 });
 
 // ---- Reports ----
-// ---- REPORTS (bagong endpoints) ----
-
-// Yearly: 12 buwan
 // ---- Yearly report: 12 buwan ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
