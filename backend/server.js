@@ -425,25 +425,32 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
 // ---- REPORTS (bagong endpoints) ----
 
 // Yearly: 12 buwan
+// ---- Yearly report: 12 buwan ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
   if (!year) return res.status(400).json({ error: 'Year required' });
   try {
     const result = await pool.query(`
-      SELECT EXTRACT(MONTH FROM sale_date) as month,
-             COALESCE(SUM(total_amount), 0) as total_sales,
-             COUNT(id) as transaction_count
-      FROM sales
-      WHERE EXTRACT(YEAR FROM sale_date) = $1
+      SELECT EXTRACT(MONTH FROM s.sale_date) as month,
+             COALESCE(SUM(si.line_total), 0) as total_sales,
+             COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
+             COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
+             COUNT(DISTINCT s.id) as transaction_count
+      FROM sales s
+      JOIN sale_items si ON s.id = si.sale_id
+      JOIN items i ON si.item_id = i.id
+      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
       GROUP BY month
       ORDER BY month
     `, [year]);
-    // Ipunan ang 12 buwan (kung may buwang walang benta, 0)
+
     const monthly = Array.from({ length: 12 }, (_, i) => {
       const existing = result.rows.find(r => parseInt(r.month) === i + 1);
       return {
         month: i + 1,
         total_sales: existing ? parseFloat(existing.total_sales) : 0,
+        total_investment: existing ? parseFloat(existing.total_investment) : 0,
+        total_profit: existing ? parseFloat(existing.total_profit) : 0,
         transaction_count: existing ? parseInt(existing.transaction_count) : 0
       };
     });
@@ -453,28 +460,35 @@ app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   }
 });
 
-// Monthly: lahat ng araw sa isang buwan
+// ---- Monthly report: lahat ng araw ----
 app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
   const { year, month } = req.query;
   if (!year || !month) return res.status(400).json({ error: 'Year and month required' });
   try {
-    // Kunin ang bilang ng araw sa buwan na iyon
-    const daysInMonth = new Date(year, month, 0).getDate(); // month ay 1-indexed, pero sa JS Date, 0 ang last day
+    const daysInMonth = new Date(year, month, 0).getDate();
     const result = await pool.query(`
-      SELECT EXTRACT(DAY FROM sale_date) as day,
-             COALESCE(SUM(total_amount), 0) as total_sales,
-             COUNT(id) as transaction_count
-      FROM sales
-      WHERE EXTRACT(YEAR FROM sale_date) = $1 AND EXTRACT(MONTH FROM sale_date) = $2
+      SELECT EXTRACT(DAY FROM s.sale_date) as day,
+             COALESCE(SUM(si.line_total), 0) as total_sales,
+             COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
+             COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
+             COUNT(DISTINCT s.id) as transaction_count
+      FROM sales s
+      JOIN sale_items si ON s.id = si.sale_id
+      JOIN items i ON si.item_id = i.id
+      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
+        AND EXTRACT(MONTH FROM s.sale_date) = $2
       GROUP BY day
       ORDER BY day
     `, [year, month]);
+
     const daily = Array.from({ length: daysInMonth }, (_, i) => {
       const day = i + 1;
       const existing = result.rows.find(r => parseInt(r.day) === day);
       return {
         day,
         total_sales: existing ? parseFloat(existing.total_sales) : 0,
+        total_investment: existing ? parseFloat(existing.total_investment) : 0,
+        total_profit: existing ? parseFloat(existing.total_profit) : 0,
         transaction_count: existing ? parseInt(existing.transaction_count) : 0
       };
     });
@@ -484,14 +498,15 @@ app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
   }
 });
 
-// Daily: mga line item ng isang araw
+// ---- Daily report: line items ----
 app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
   const { year, month, day } = req.query;
   if (!year || !month || !day) return res.status(400).json({ error: 'Year, month, day required' });
   try {
     const result = await pool.query(`
-      SELECT si.id, i.name as item_name, i.description, i.brand, i.part_number, i.oem_number,
-             si.quantity, si.unit_price, si.line_total
+      SELECT i.name as item_name, i.description, i.brand,
+             i.investment, si.quantity, si.unit_price, si.line_total,
+             (si.unit_price - i.investment) * si.quantity as profit
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.id
       JOIN items i ON si.item_id = i.id
@@ -500,7 +515,16 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
         AND EXTRACT(DAY FROM s.sale_date) = $3
       ORDER BY s.created_at
     `, [year, month, day]);
-    res.json(result.rows);
+    // I-parse ang numerikong fields
+    const data = result.rows.map(row => ({
+      ...row,
+      investment: parseFloat(row.investment) || 0,
+      unit_price: parseFloat(row.unit_price) || 0,
+      line_total: parseFloat(row.line_total) || 0,
+      profit: parseFloat(row.profit) || 0,
+      quantity: parseInt(row.quantity) || 0
+    }));
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch daily report' });
   }
