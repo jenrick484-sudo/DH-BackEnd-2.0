@@ -527,6 +527,192 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
   }
 });
 
+// GET all customers
+app.get('/api/customers', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM customers ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+// POST new customer
+app.post('/api/customers', authenticateToken, async (req, res) => {
+  const { name, contact } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO customers (name, contact) VALUES ($1, $2) RETURNING *',
+      [name, contact || '']
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Customer might already exist' });
+  }
+});
+
+// POST a charge (same logic as sales but with customer_id)
+app.post('/api/charges', authenticateToken, async (req, res) => {
+  const { customer_id, items } = req.body; // items: [{ item_id, quantity, unit_price }]
+  if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Items array required' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let total = 0;
+    const chargeItems = [];
+    for (const line of items) {
+      const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
+      if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
+      const item = itemRes.rows[0];
+      const unitPrice = line.unit_price || item.price;
+      const lineTotal = unitPrice * line.quantity;
+      total += lineTotal;
+      chargeItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
+      // Deduct inventory
+      const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
+      if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
+        throw new Error(`Insufficient stock for item "${item.name}"`);
+      }
+      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
+    }
+    const chargeResult = await client.query(
+      'INSERT INTO charges (customer_id, total_amount, created_by) VALUES ($1, $2, $3) RETURNING id',
+      [customer_id, total, req.user.id]
+    );
+    const chargeId = chargeResult.rows[0].id;
+    for (const ci of chargeItems) {
+      await client.query(
+        'INSERT INTO charge_items (charge_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
+        [chargeId, ci.item_id, ci.quantity, ci.unit_price, ci.line_total]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ charge_id: chargeId, total_amount: total });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get all charges (with line items) – may filter by customer at date
+app.get('/api/charges', authenticateToken, async (req, res) => {
+  const { customer_id, year, month, day } = req.query;
+  let where = '1=1';
+  const params = [];
+  if (customer_id) {
+    params.push(customer_id);
+    where += ` AND c.customer_id = $${params.length}`;
+  }
+  if (year) {
+    params.push(year);
+    where += ` AND EXTRACT(YEAR FROM c.charge_date) = $${params.length}`;
+  }
+  if (month) {
+    params.push(month);
+    where += ` AND EXTRACT(MONTH FROM c.charge_date) = $${params.length}`;
+  }
+  if (day) {
+    params.push(day);
+    where += ` AND EXTRACT(DAY FROM c.charge_date) = $${params.length}`;
+  }
+
+  try {
+    const result = await pool.query(`
+      SELECT c.*, cust.name as customer_name,
+             COALESCE(json_agg(
+               json_build_object(
+                 'id', ci.id,
+                 'item_name', i.name,
+                 'quantity', ci.quantity,
+                 'unit_price', ci.unit_price,
+                 'line_total', ci.line_total
+               )
+             ) FILTER (WHERE ci.id IS NOT NULL), '[]') as line_items
+      FROM charges c
+      JOIN customers cust ON c.customer_id = cust.id
+      LEFT JOIN charge_items ci ON c.id = ci.charge_id
+      LEFT JOIN items i ON ci.item_id = i.id
+      WHERE ${where}
+      GROUP BY c.id, cust.name
+      ORDER BY c.charge_date DESC
+    `, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch charges' });
+  }
+});
+
+// Get charge summary per customer (for Customer tab)
+app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT cust.id as customer_id, cust.name as customer_name,
+             COUNT(DISTINCT c.id) as charge_count,
+             COALESCE(SUM(c.total_amount), 0) as total_amount
+      FROM customers cust
+      LEFT JOIN charges c ON cust.id = c.customer_id
+      GROUP BY cust.id, cust.name
+      ORDER BY cust.name
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch customer summary' });
+  }
+});
+
+// Get dates of charges for a specific customer (for Date view)
+app.get('/api/charges/dates', authenticateToken, async (req, res) => {
+  const { customer_id } = req.query;
+  if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
+  try {
+    const result = await pool.query(`
+      SELECT charge_date, COUNT(id) as charge_count, SUM(total_amount) as daily_total
+      FROM charges
+      WHERE customer_id = $1
+      GROUP BY charge_date
+      ORDER BY charge_date DESC
+    `, [customer_id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch charge dates' });
+  }
+});
+
+// Get items for a specific customer and date (for Item view)
+app.get('/api/charges/items', authenticateToken, async (req, res) => {
+  const { customer_id, date } = req.query;
+  if (!customer_id || !date) return res.status(400).json({ error: 'Customer ID and date required' });
+  try {
+    const result = await pool.query(`
+      SELECT i.name as item_name, i.description, i.brand, i.investment,
+             ci.quantity, ci.unit_price, ci.line_total,
+             (ci.unit_price - i.investment) * ci.quantity as profit
+      FROM charge_items ci
+      JOIN charges c ON ci.charge_id = c.id
+      JOIN items i ON ci.item_id = i.id
+      WHERE c.customer_id = $1 AND c.charge_date = $2
+      ORDER BY c.created_at
+    `, [customer_id, date]);
+    const data = result.rows.map(row => ({
+      ...row,
+      investment: parseFloat(row.investment) || 0,
+      unit_price: parseFloat(row.unit_price) || 0,
+      line_total: parseFloat(row.line_total) || 0,
+      profit: parseFloat(row.profit) || 0,
+      quantity: parseInt(row.quantity) || 0
+    }));
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch charge items' });
+  }
+});
+
 // Dashboard summary
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
@@ -550,6 +736,8 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
