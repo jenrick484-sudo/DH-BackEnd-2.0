@@ -80,6 +80,28 @@ async function initDB() {
       unit_price DECIMAL(10,2) NOT NULL,
       line_total DECIMAL(10,2) NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS customers (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) UNIQUE NOT NULL,
+      contact VARCHAR(100),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS charges (
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER REFERENCES customers(id),
+      charge_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      total_amount DECIMAL(10,2) NOT NULL,
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS charge_items (
+      id SERIAL PRIMARY KEY,
+      charge_id INTEGER REFERENCES charges(id) ON DELETE CASCADE,
+      item_id INTEGER REFERENCES items(id),
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      unit_price DECIMAL(10,2) NOT NULL,
+      line_total DECIMAL(10,2) NOT NULL
+    );
   `);
   console.log('All tables ready');
 }
