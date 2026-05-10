@@ -102,6 +102,12 @@ async function initDB() {
       unit_price DECIMAL(10,2) NOT NULL,
       line_total DECIMAL(10,2) NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS customer_images (
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+      image_data TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
   `);
   console.log('All tables ready');
 }
@@ -562,9 +568,15 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
-    res.json(result.rows[0]);
+    const custResult = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
+    if (custResult.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    const customer = custResult.rows[0];
+    const imagesResult = await pool.query(
+      'SELECT id, image_data FROM customer_images WHERE customer_id = $1 ORDER BY id',
+      [id]
+    );
+    customer.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
+    res.json(customer);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch customer' });
   }
@@ -572,33 +584,66 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 
 // POST new customer
 app.post('/api/customers', authenticateToken, async (req, res) => {
-  const { name, company_name, owner, address, contact_number, photo_data } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
+  const { name, company_name, owner, address, contact_number, contact_number2, images } = req.body;
+  if (!name) return res.status(400).json({ error: 'Company name required' });
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `INSERT INTO customers (name, company_name, owner, address, contact_number, photo_data)
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO customers (name, company_name, owner, address, contact_number, contact_number2)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name, company_name || '', owner || '', address || '', contact_number || '', photo_data || '']
+      [name, company_name || '', owner || '', address || '', contact_number || '', contact_number2 || '']
     );
-    res.status(201).json(result.rows[0]);
+    const newCust = result.rows[0];
+    // Ipasok ang mga larawan (hanggang 6)
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO customer_images (customer_id, image_data) VALUES ($1, $2)', [newCust.id, imgBase64]);
+        }
+      }
+    }
+    await client.query('COMMIT');
+    res.status(201).json(newCust);
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: 'Customer might already exist' });
+  } finally {
+    client.release();
   }
 });
 
 app.put('/api/customers/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { name, company_name, owner, address, contact_number, photo_data } = req.body;
+  const { name, company_name, owner, address, contact_number, contact_number2, images } = req.body;
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `UPDATE customers SET name=$1, company_name=$2, owner=$3, address=$4, contact_number=$5, photo_data=$6
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE customers SET name=$1, company_name=$2, owner=$3, address=$4, contact_number=$5, contact_number2=$6
        WHERE id=$7 RETURNING *`,
-      [name, company_name, owner, address, contact_number, photo_data, id]
+      [name, company_name, owner, address, contact_number, contact_number2, id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    // Palitan ang mga larawan: burahin lahat, saka ipasok ang bago
+    await client.query('DELETE FROM customer_images WHERE customer_id = $1', [id]);
+    if (images && Array.isArray(images)) {
+      for (const imgBase64 of images.slice(0, 6)) {
+        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+          await client.query('INSERT INTO customer_images (customer_id, image_data) VALUES ($1, $2)', [id, imgBase64]);
+        }
+      }
+    }
+    await client.query('COMMIT');
     res.json(result.rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: 'Failed to update customer' });
+  } finally {
+    client.release();
   }
 });
 
@@ -702,12 +747,12 @@ app.get('/api/charges', authenticateToken, async (req, res) => {
 app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT cust.id as customer_id, cust.name as customer_name,
+      SELECT cust.id as customer_id, cust.name as company_name, cust.owner,
              COUNT(DISTINCT c.id) as charge_count,
              COALESCE(SUM(c.total_amount), 0) as total_amount
       FROM customers cust
       LEFT JOIN charges c ON cust.id = c.customer_id
-      GROUP BY cust.id, cust.name
+      GROUP BY cust.id, cust.name, cust.owner
       ORDER BY cust.name
     `);
     res.json(result.rows);
