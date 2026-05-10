@@ -559,18 +559,46 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/customers/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch customer' });
+  }
+});
+
 // POST new customer
 app.post('/api/customers', authenticateToken, async (req, res) => {
-  const { name, contact } = req.body;
+  const { name, company_name, owner, address, contact_number, photo_data } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   try {
     const result = await pool.query(
-      'INSERT INTO customers (name, contact) VALUES ($1, $2) RETURNING *',
-      [name, contact || '']
+      `INSERT INTO customers (name, company_name, owner, address, contact_number, photo_data)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [name, company_name || '', owner || '', address || '', contact_number || '', photo_data || '']
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Customer might already exist' });
+  }
+});
+
+app.put('/api/customers/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { name, company_name, owner, address, contact_number, photo_data } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE customers SET name=$1, company_name=$2, owner=$3, address=$4, contact_number=$5, photo_data=$6
+       WHERE id=$7 RETURNING *`,
+      [name, company_name, owner, address, contact_number, photo_data, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update customer' });
   }
 });
 
