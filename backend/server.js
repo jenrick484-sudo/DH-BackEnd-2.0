@@ -22,12 +22,9 @@ async function authenticateToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    // Kunin ang tunay na user mula sa database
     const userResult = await pool.query('SELECT id, username FROM users WHERE id = $1', [decoded.id]);
-    if (userResult.rows.length === 0) {
-      return res.sendStatus(401);   // wala nang ganitong user
-    }
-    req.user = userResult.rows[0];  // totoong user row (id at username)
+    if (userResult.rows.length === 0) return res.sendStatus(401);
+    req.user = userResult.rows[0];
     next();
   } catch (err) {
     console.error('Auth error:', err);
@@ -35,7 +32,7 @@ async function authenticateToken(req, res, next) {
   }
 }
 
-// ---- INIT DB (pareho) ----
+// ---- INIT DB ----
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -83,7 +80,17 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS customers (
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) UNIQUE NOT NULL,
-      contact VARCHAR(100),
+      company_name VARCHAR(255),
+      owner VARCHAR(255),
+      address TEXT,
+      contact_number VARCHAR(100),
+      contact_number2 VARCHAR(100),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS customer_images (
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+      image_data TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS charges (
@@ -101,12 +108,6 @@ async function initDB() {
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       unit_price DECIMAL(10,2) NOT NULL,
       line_total DECIMAL(10,2) NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS customer_images (
-      id SERIAL PRIMARY KEY,
-      customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
-      image_data TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
   console.log('All tables ready');
@@ -147,8 +148,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ---- Item routes ----
-// Kunin lahat ng items (kasama ang current stock mula sa inventory)
+// ---- ITEMS ----
 app.get('/api/items', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -163,7 +163,6 @@ app.get('/api/items', authenticateToken, async (req, res) => {
   }
 });
 
-// Magdagdag ng bagong item (kasama ang initial stock)
 app.post('/api/items', authenticateToken, async (req, res) => {
   const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
@@ -177,9 +176,8 @@ app.post('/api/items', authenticateToken, async (req, res) => {
     );
     const newItem = itemResult.rows[0];
     await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
-    // Ipasok ang mga larawan (kung mayroon)
     if (images && Array.isArray(images)) {
-      for (const imgBase64 of images.slice(0, 6)) {  // hanggang 6 lang
+      for (const imgBase64 of images.slice(0, 6)) {
         if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
           await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [newItem.id, imgBase64]);
         }
@@ -195,22 +193,18 @@ app.post('/api/items', authenticateToken, async (req, res) => {
   }
 });
 
-// I-update ang item (details at stock)
 app.put('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { name, description, brand, investment, price, part_number, oem_number, stock, images } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Update item details
     await client.query(
       `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7
        WHERE id=$8`,
       [name, description, brand, investment, price, part_number, oem_number, id]
     );
-    // Update stock
     await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
-    // Palitan ang mga imahe: burahin lahat, saka ipasok ang bago
     await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
     if (images && Array.isArray(images)) {
       for (const imgBase64 of images.slice(0, 6)) {
@@ -235,7 +229,6 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Kunin ang isang item (kasama ang mga larawan)
 app.get('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -247,10 +240,7 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
     `, [id]);
     if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
     const item = itemResult.rows[0];
-    const imagesResult = await pool.query(
-      'SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id',
-      [id]
-    );
+    const imagesResult = await pool.query('SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id', [id]);
     item.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
     res.json(item);
   } catch (err) {
@@ -258,7 +248,7 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- Inventory routes ----
+// ---- INVENTORY ----
 app.get('/api/inventory', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -289,8 +279,9 @@ app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
   }
 });
 
+// ---- SALES ----
 app.post('/api/sales', authenticateToken, async (req, res) => {
-  const { items } = req.body; // array of { item_id, quantity, unit_price? }
+  const { items } = req.body;
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Items array required' });
   }
@@ -307,14 +298,12 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
       const lineTotal = unitPrice * line.quantity;
       total += lineTotal;
       saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
-      // Deduct inventory
       const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
       if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
         throw new Error(`Insufficient stock for item "${item.name}"`);
       }
       await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
     }
-    // Gamitin ang req.user.id (may confirmed user na)
     const saleResult = await client.query(
       'INSERT INTO sales (total_amount, created_by) VALUES ($1, $2) RETURNING id',
       [total, req.user.id]
@@ -336,7 +325,6 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- GET SALES (may COALESCE para walang null) ----
 app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -363,7 +351,6 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- UPDATE A LINE ITEM ----
 app.put('/api/sales/item/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { quantity, unit_price } = req.body;
@@ -395,62 +382,40 @@ app.put('/api/sales/item/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- DELETE A LINE ITEM (permanente) ----
 app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  console.log('DELETE sale_item id:', id);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Hanapin ang line item
     const old = await client.query('SELECT * FROM sale_items WHERE id = $1', [id]);
     if (old.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Line item not found' });
     }
-
     const { item_id, quantity, sale_id } = old.rows[0];
-
-    // Ibalik ang stock
-    await client.query(
-      'UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2',
-      [quantity, item_id]
-    );
-
-    // Burahin ang line item
+    await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE item_id = $2', [quantity, item_id]);
     await client.query('DELETE FROM sale_items WHERE id = $1', [id]);
-
-    // Tingnan kung may natitirang ibang line items
     const remaining = await client.query(
       'SELECT COALESCE(SUM(line_total), 0) as total, COUNT(*) as cnt FROM sale_items WHERE sale_id = $1',
       [sale_id]
     );
-
     if (remaining.rows[0].cnt === 0) {
-      // Wala nang item – burahin ang buong sales record
       await client.query('DELETE FROM sales WHERE id = $1', [sale_id]);
-      console.log(`Sales ${sale_id} deleted (no items left)`);
     } else {
-      // May natira pa, i-update lang ang total
       await client.query('UPDATE sales SET total_amount = $1 WHERE id = $2',
         [remaining.rows[0].total, sale_id]);
     }
-
     await client.query('COMMIT');
-    console.log('Delete success for sale_item id:', id);
     res.json({ message: 'Deleted' });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Delete error:', err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
-// ---- Reports ----
-// ---- Yearly report: 12 buwan ----
+// ---- REPORTS ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
   if (!year) return res.status(400).json({ error: 'Year required' });
@@ -468,7 +433,6 @@ app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
       GROUP BY month
       ORDER BY month
     `, [year]);
-
     const monthly = Array.from({ length: 12 }, (_, i) => {
       const existing = result.rows.find(r => parseInt(r.month) === i + 1);
       return {
@@ -485,7 +449,6 @@ app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- Monthly report: lahat ng araw ----
 app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
   const { year, month } = req.query;
   if (!year || !month) return res.status(400).json({ error: 'Year and month required' });
@@ -500,12 +463,10 @@ app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
       FROM sales s
       JOIN sale_items si ON s.id = si.sale_id
       JOIN items i ON si.item_id = i.id
-      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
-        AND EXTRACT(MONTH FROM s.sale_date) = $2
+      WHERE EXTRACT(YEAR FROM s.sale_date) = $1 AND EXTRACT(MONTH FROM s.sale_date) = $2
       GROUP BY day
       ORDER BY day
     `, [year, month]);
-
     const daily = Array.from({ length: daysInMonth }, (_, i) => {
       const day = i + 1;
       const existing = result.rows.find(r => parseInt(r.day) === day);
@@ -523,7 +484,6 @@ app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- Daily report: line items ----
 app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
   const { year, month, day } = req.query;
   if (!year || !month || !day) return res.status(400).json({ error: 'Year, month, day required' });
@@ -535,12 +495,9 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.id
       JOIN items i ON si.item_id = i.id
-      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
-        AND EXTRACT(MONTH FROM s.sale_date) = $2
-        AND EXTRACT(DAY FROM s.sale_date) = $3
+      WHERE EXTRACT(YEAR FROM s.sale_date) = $1 AND EXTRACT(MONTH FROM s.sale_date) = $2 AND EXTRACT(DAY FROM s.sale_date) = $3
       ORDER BY s.created_at
     `, [year, month, day]);
-    // I-parse ang numerikong fields
     const data = result.rows.map(row => ({
       ...row,
       investment: parseFloat(row.investment) || 0,
@@ -555,7 +512,7 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
   }
 });
 
-// GET all customers
+// ---- CUSTOMERS ----
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM customers ORDER BY name');
@@ -582,7 +539,6 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// POST new customer
 app.post('/api/customers', authenticateToken, async (req, res) => {
   const { name, company_name, owner, address, contact_number, contact_number2, images } = req.body;
   if (!name) return res.status(400).json({ error: 'Company name required' });
@@ -595,7 +551,6 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       [name, company_name || '', owner || '', address || '', contact_number || '', contact_number2 || '']
     );
     const newCust = result.rows[0];
-    // Ipasok ang mga larawan (hanggang 6)
     if (images && Array.isArray(images)) {
       for (const imgBase64 of images.slice(0, 6)) {
         if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
@@ -628,7 +583,6 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Customer not found' });
     }
-    // Palitan ang mga larawan: burahin lahat, saka ipasok ang bago
     await client.query('DELETE FROM customer_images WHERE customer_id = $1', [id]);
     if (images && Array.isArray(images)) {
       for (const imgBase64 of images.slice(0, 6)) {
@@ -647,9 +601,9 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// POST a charge (same logic as sales but with customer_id)
+// ---- CHARGES ----
 app.post('/api/charges', authenticateToken, async (req, res) => {
-  const { customer_id, items } = req.body; // items: [{ item_id, quantity, unit_price }]
+  const { customer_id, items } = req.body;
   if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Items array required' });
@@ -667,7 +621,6 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
       const lineTotal = unitPrice * line.quantity;
       total += lineTotal;
       chargeItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
-      // Deduct inventory
       const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
       if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
         throw new Error(`Insufficient stock for item "${item.name}"`);
@@ -695,27 +648,14 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
   }
 });
 
-// Get all charges (with line items) – may filter by customer at date
 app.get('/api/charges', authenticateToken, async (req, res) => {
   const { customer_id, year, month, day } = req.query;
   let where = '1=1';
   const params = [];
-  if (customer_id) {
-    params.push(customer_id);
-    where += ` AND c.customer_id = $${params.length}`;
-  }
-  if (year) {
-    params.push(year);
-    where += ` AND EXTRACT(YEAR FROM c.charge_date) = $${params.length}`;
-  }
-  if (month) {
-    params.push(month);
-    where += ` AND EXTRACT(MONTH FROM c.charge_date) = $${params.length}`;
-  }
-  if (day) {
-    params.push(day);
-    where += ` AND EXTRACT(DAY FROM c.charge_date) = $${params.length}`;
-  }
+  if (customer_id) { params.push(customer_id); where += ` AND c.customer_id = $${params.length}`; }
+  if (year) { params.push(year); where += ` AND EXTRACT(YEAR FROM c.charge_date) = $${params.length}`; }
+  if (month) { params.push(month); where += ` AND EXTRACT(MONTH FROM c.charge_date) = $${params.length}`; }
+  if (day) { params.push(day); where += ` AND EXTRACT(DAY FROM c.charge_date) = $${params.length}`; }
 
   try {
     const result = await pool.query(`
@@ -743,11 +683,10 @@ app.get('/api/charges', authenticateToken, async (req, res) => {
   }
 });
 
-// Get charge summary per customer (for Customer tab)
 app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT cust.id as customer_id, cust.name as company_name, cust.owner,
+      SELECT cust.id as customer_id, cust.name as customer_name, cust.owner,
              COUNT(DISTINCT c.id) as charge_count,
              COALESCE(SUM(c.total_amount), 0) as total_amount
       FROM customers cust
@@ -761,7 +700,6 @@ app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => 
   }
 });
 
-// Get dates of charges for a specific customer (for Date view)
 app.get('/api/charges/dates', authenticateToken, async (req, res) => {
   const { customer_id } = req.query;
   if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
@@ -779,7 +717,6 @@ app.get('/api/charges/dates', authenticateToken, async (req, res) => {
   }
 });
 
-// Get items for a specific customer and date (for Item view)
 app.get('/api/charges/items', authenticateToken, async (req, res) => {
   const { customer_id, date } = req.query;
   if (!customer_id || !date) return res.status(400).json({ error: 'Customer ID and date required' });
@@ -808,14 +745,10 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
   }
 });
 
-// Dashboard summary
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const salesToday = await pool.query(
-      'SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1',
-      [today]
-    );
+    const salesToday = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1', [today]);
     const itemCount = await pool.query('SELECT COUNT(*) as count FROM items');
     const inventoryValue = await pool.query(`
       SELECT COALESCE(SUM(i.price * inv.quantity), 0) as value
@@ -831,8 +764,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
