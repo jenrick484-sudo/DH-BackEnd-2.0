@@ -718,19 +718,18 @@ app.get('/api/charges/dates', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/charges/items', authenticateToken, async (req, res) => {
-  const { customer_id, date } = req.query;
-  if (!customer_id || !date) return res.status(400).json({ error: 'Customer ID and date required' });
+  const { charge_id } = req.query;
+  if (!charge_id) return res.status(400).json({ error: 'Charge ID required' });
   try {
     const result = await pool.query(`
       SELECT i.name as item_name, i.description, i.brand, i.investment,
              ci.quantity, ci.unit_price, ci.line_total,
              (ci.unit_price - i.investment) * ci.quantity as profit
       FROM charge_items ci
-      JOIN charges c ON ci.charge_id = c.id
       JOIN items i ON ci.item_id = i.id
-      WHERE c.customer_id = $1 AND c.charge_date = $2
-      ORDER BY c.created_at
-    `, [customer_id, date]);
+      WHERE ci.charge_id = $1
+      ORDER BY ci.id
+    `, [charge_id]);
     const data = result.rows.map(row => ({
       ...row,
       investment: parseFloat(row.investment) || 0,
@@ -742,6 +741,34 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch charge items' });
+  }
+});
+
+app.get('/api/charges/total', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT COALESCE(SUM(total_amount), 0) as overall_total FROM charges`);
+    res.json({ overall_total: parseFloat(result.rows[0].overall_total) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch total charges' });
+  }
+});
+
+app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
+  const { customer_id } = req.query;
+  if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
+  try {
+    const result = await pool.query(`
+      SELECT c.id, c.charge_date, c.created_at, c.total_amount,
+             COUNT(ci.id) as item_count
+      FROM charges c
+      LEFT JOIN charge_items ci ON c.id = ci.charge_id
+      WHERE c.customer_id = $1
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+    `, [customer_id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch charges' });
   }
 });
 
