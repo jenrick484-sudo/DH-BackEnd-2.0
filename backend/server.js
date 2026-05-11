@@ -437,6 +437,25 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
   }
 });
 
+app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const sale = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
+    if (sale.rows.length === 0) return res.status(404).json({ error: 'Sale not found' });
+
+    const { sale_type } = sale.rows[0];
+    if (sale_type === 'cash') {
+      return res.status(400).json({ error: 'Cannot delete cash sale directly. Delete its items first.' });
+    }
+
+    // Burahin ang DATA sale
+    await pool.query('DELETE FROM sales WHERE id = $1', [id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---- REPORTS ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
