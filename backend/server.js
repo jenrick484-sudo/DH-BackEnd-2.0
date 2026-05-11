@@ -100,6 +100,7 @@ async function initDB() {
       customer_id INTEGER REFERENCES customers(id),
       charge_date DATE NOT NULL DEFAULT CURRENT_DATE,
       total_amount DECIMAL(10,2) NOT NULL,
+      paid_amount DECIMAL(10,2) DEFAULT 0,
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT NOW()
     );
@@ -112,6 +113,10 @@ async function initDB() {
       line_total DECIMAL(10,2) NOT NULL
     );
   `);
+
+  // Siguraduhing may paid_amount column (kung lumang database)
+  await pool.query(`ALTER TABLE charges ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(10,2) DEFAULT 0`);
+
   console.log('All tables ready');
 }
 initDB();
@@ -281,11 +286,11 @@ app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
   }
 });
 
+// ---- SALES ----
 app.post('/api/sales', authenticateToken, async (req, res) => {
   const { items, sale_type, customer_id, total_amount } = req.body;
   const type = sale_type || 'cash';
 
-  // Para sa cash sale, kailangan ng items
   if (type === 'cash' && (!items || !Array.isArray(items) || items.length === 0)) {
     return res.status(400).json({ error: 'Items array required for cash sale' });
   }
@@ -296,7 +301,6 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     let total = 0;
 
     if (type === 'cash') {
-      // Parehong logic tulad ng dati: inventory deduction, line items, atbp.
       const saleItems = [];
       for (const line of items) {
         const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
@@ -312,7 +316,6 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         }
         await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
       }
-      // Ipasok ang sales header
       const saleResult = await client.query(
         `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
         [total, 'cash', null, req.user.id]
@@ -330,11 +333,11 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
       total = parseFloat(total_amount) || 0;
       let remaining = total;
 
-      // Kunin ang lahat ng unpaid charges ng customer, pinakaluma muna
       const unpaidCharges = await client.query(
-        `SELECT id, total_amount, paid_amount FROM charges
-        WHERE customer_id = $1 AND paid_amount < total_amount
-        ORDER BY charge_date, id`,
+        `SELECT id, total_amount, COALESCE(paid_amount,0) as paid_amount
+         FROM charges
+         WHERE customer_id = $1 AND COALESCE(paid_amount,0) < total_amount
+         ORDER BY charge_date, id`,
         [customer_id]
       );
 
@@ -343,13 +346,12 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         const due = parseFloat(charge.total_amount) - parseFloat(charge.paid_amount);
         const toPay = Math.min(remaining, due);
         await client.query(
-          'UPDATE charges SET paid_amount = paid_amount + $1 WHERE id = $2',
+          'UPDATE charges SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id = $2',
           [toPay, charge.id]
         );
         remaining -= toPay;
       }
 
-      // Ipasok ang DATA sale record
       await client.query(
         `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4)`,
         [total, 'data', customer_id, req.user.id]
@@ -463,13 +465,10 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
   try {
     const sale = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
     if (sale.rows.length === 0) return res.status(404).json({ error: 'Sale not found' });
-
     const { sale_type } = sale.rows[0];
     if (sale_type === 'cash') {
       return res.status(400).json({ error: 'Cannot delete cash sale directly. Delete its items first.' });
     }
-
-    // Burahin ang DATA sale
     await pool.query('DELETE FROM sales WHERE id = $1', [id]);
     res.json({ message: 'Deleted' });
   } catch (err) {
@@ -590,10 +589,7 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
     const custResult = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
     if (custResult.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
     const customer = custResult.rows[0];
-    const imagesResult = await pool.query(
-      'SELECT id, image_data FROM customer_images WHERE customer_id = $1 ORDER BY id',
-      [id]
-    );
+    const imagesResult = await pool.query('SELECT id, image_data FROM customer_images WHERE customer_id = $1 ORDER BY id', [id]);
     customer.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
     res.json(customer);
   } catch (err) {
@@ -690,7 +686,7 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
       await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
     }
     const chargeResult = await client.query(
-      'INSERT INTO charges (customer_id, total_amount, created_by) VALUES ($1, $2, $3) RETURNING id',
+      'INSERT INTO charges (customer_id, total_amount, paid_amount, created_by) VALUES ($1, $2, 0, $3) RETURNING id',
       [customer_id, total, req.user.id]
     );
     const chargeId = chargeResult.rows[0].id;
@@ -750,10 +746,11 @@ app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => 
     const result = await pool.query(`
       SELECT cust.id as customer_id, cust.name as customer_name, cust.owner,
           COUNT(DISTINCT c.id) as charge_count,
-          COALESCE(SUM(c.total_amount), 0) as total_amount
+          COALESCE(SUM(c.total_amount - COALESCE(c.paid_amount,0)), 0) as total_amount
       FROM customers cust
       LEFT JOIN charges c ON cust.id = c.customer_id
       GROUP BY cust.id, cust.name, cust.owner
+      ORDER BY cust.name
     `);
     res.json(result.rows);
   } catch (err) {
@@ -805,12 +802,13 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
   }
 });
 
+// ---- TOTALS para sa toolbar (outstanding = total - paid) ----
 app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   const { customer_id, charge_id } = req.query;
   try {
     let query = `
       SELECT
-        COALESCE(SUM(c.total_amount - c.paid_amount), 0) as overall_outstanding
+        COALESCE(SUM(c.total_amount - COALESCE(c.paid_amount, 0)), 0) as overall_total
       FROM charges c
       WHERE 1=1
     `;
@@ -823,9 +821,10 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
       params.push(charge_id);
       query += ` AND c.id = $${params.length}`;
     }
+
     const result = await pool.query(query, params);
-    const outstanding = parseFloat(result.rows[0].overall_outstanding);
-    // Dito natin iko‑compute ang investment (70%) at profit (30%)
+    const outstanding = parseFloat(result.rows[0].overall_total);
+    // 70% investment, 30% profit
     const overall_total = outstanding;
     const overall_investment = overall_total * 0.7;
     const overall_profit = overall_total * 0.3;
@@ -835,14 +834,16 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   }
 });
 
+// --- BY CUSTOMER (listahan ng charges na may outstanding) ---
 app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
   const { customer_id } = req.query;
   if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
   try {
     const result = await pool.query(`
-      SELECT c.id, c.charge_date, c.created_at, c.total_amount, c.paid_amount,
+      SELECT c.id, c.charge_date, c.created_at, c.total_amount,
+             COALESCE(c.paid_amount, 0) as paid_amount,
              COUNT(ci.id) as item_count,
-             c.total_amount - c.paid_amount as outstanding
+             c.total_amount - COALESCE(c.paid_amount, 0) as outstanding
       FROM charges c
       LEFT JOIN charge_items ci ON c.id = ci.charge_id
       WHERE c.customer_id = $1
@@ -855,27 +856,7 @@ app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/dashboard', authenticateToken, async (req, res) => {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const salesToday = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1', [today]);
-    const itemCount = await pool.query('SELECT COUNT(*) as count FROM items');
-    const inventoryValue = await pool.query(`
-      SELECT COALESCE(SUM(i.price * inv.quantity), 0) as value
-      FROM inventory inv
-      JOIN items i ON inv.item_id = i.id
-    `);
-    res.json({
-      today_sales: parseFloat(salesToday.rows[0].total),
-      total_items: parseInt(itemCount.rows[0].count),
-      inventory_value: parseFloat(inventoryValue.rows[0].value)
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Kumuha ng pinagsamang transaksyon ng isang customer (charges + DATA sales)
+// --- TRANSACTION HISTORY (passbook) ---
 app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -901,7 +882,6 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
       ORDER BY t.date, t.seq
     `, [id]);
 
-    // I-parse ang numeric fields para ligtas
     const transactions = result.rows.map(row => ({
       date: row.date,
       type: row.type,
@@ -911,6 +891,26 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
     res.json(transactions);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const salesToday = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total FROM sales WHERE sale_date = $1', [today]);
+    const itemCount = await pool.query('SELECT COUNT(*) as count FROM items');
+    const inventoryValue = await pool.query(`
+      SELECT COALESCE(SUM(i.price * inv.quantity), 0) as value
+      FROM inventory inv
+      JOIN items i ON inv.item_id = i.id
+    `);
+    res.json({
+      today_sales: parseFloat(salesToday.rows[0].total),
+      total_items: parseInt(itemCount.rows[0].count),
+      inventory_value: parseFloat(inventoryValue.rows[0].value)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
