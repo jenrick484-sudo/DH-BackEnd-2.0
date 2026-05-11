@@ -475,18 +475,59 @@ app.delete('/api/sales/item/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
   try {
-    const sale = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
-    if (sale.rows.length === 0) return res.status(404).json({ error: 'Sale not found' });
-    const { sale_type } = sale.rows[0];
+    await client.query('BEGIN');
+
+    // Kunin ang sale
+    const sale = await client.query('SELECT * FROM sales WHERE id = $1', [id]);
+    if (sale.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Sale not found' });
+    }
+
+    const { sale_type, customer_id, total_amount } = sale.rows[0];
+
     if (sale_type === 'cash') {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Cannot delete cash sale directly. Delete its items first.' });
     }
-    // Ibalik ang bayad? Puwede, pero sa ngayon, simpleng delete lang
-    await pool.query('DELETE FROM sales WHERE id = $1', [id]);
+
+    // --- DATA sale: ibalik ang bayad sa mga charges (reverse FIFO) ---
+    if (sale_type === 'data') {
+      let remaining = parseFloat(total_amount);
+
+      // Kunin ang charges na may paid_amount > 0, simula sa pinakahuli
+      const paidCharges = await client.query(
+        `SELECT id, COALESCE(paid_amount, 0) as paid_amount
+         FROM charges
+         WHERE customer_id = $1 AND COALESCE(paid_amount, 0) > 0
+         ORDER BY charge_date DESC, id DESC`,
+        [customer_id]
+      );
+
+      for (const charge of paidCharges.rows) {
+        if (remaining <= 0) break;
+        const currentPaid = parseFloat(charge.paid_amount);
+        const toRefund = Math.min(remaining, currentPaid);
+        await client.query(
+          'UPDATE charges SET paid_amount = paid_amount - $1 WHERE id = $2',
+          [toRefund, charge.id]
+        );
+        remaining -= toRefund;
+      }
+    }
+
+    // Burahin ang sales record
+    await client.query('DELETE FROM sales WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
     res.json({ message: 'Deleted' });
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
