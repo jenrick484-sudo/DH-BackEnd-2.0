@@ -325,10 +325,31 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         );
       }
     } else if (type === 'data') {
-      // DATA sale: walang item, gamitin ang total_amount mula sa request
-      total = parseFloat(total_amount) || 0;
+      // DATA sale: ipamahagi ang bayad sa mga unpaid charges (FIFO)
       if (!customer_id) throw new Error('Customer ID required for DATA sale');
-      // Ipasok lang ang header
+      total = parseFloat(total_amount) || 0;
+      let remaining = total;
+
+      // Kunin ang lahat ng unpaid charges ng customer, pinakaluma muna
+      const unpaidCharges = await client.query(
+        `SELECT id, total_amount, paid_amount FROM charges
+        WHERE customer_id = $1 AND paid_amount < total_amount
+        ORDER BY charge_date, id`,
+        [customer_id]
+      );
+
+      for (const charge of unpaidCharges.rows) {
+        if (remaining <= 0) break;
+        const due = parseFloat(charge.total_amount) - parseFloat(charge.paid_amount);
+        const toPay = Math.min(remaining, due);
+        await client.query(
+          'UPDATE charges SET paid_amount = paid_amount + $1 WHERE id = $2',
+          [toPay, charge.id]
+        );
+        remaining -= toPay;
+      }
+
+      // Ipasok ang DATA sale record
       await client.query(
         `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4)`,
         [total, 'data', customer_id, req.user.id]
@@ -789,16 +810,11 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   try {
     let query = `
       SELECT
-        COALESCE(SUM(ci.line_total), 0) as overall_total,
-        COALESCE(SUM((ci.unit_price - i.investment) * ci.quantity), 0) as overall_profit,
-        COALESCE(SUM(i.investment * ci.quantity), 0) as overall_investment
+        COALESCE(SUM(c.total_amount - c.paid_amount), 0) as overall_outstanding
       FROM charges c
-      JOIN charge_items ci ON c.id = ci.charge_id
-      JOIN items i ON ci.item_id = i.id
       WHERE 1=1
     `;
     const params = [];
-
     if (customer_id) {
       params.push(customer_id);
       query += ` AND c.customer_id = $${params.length}`;
@@ -807,14 +823,13 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
       params.push(charge_id);
       query += ` AND c.id = $${params.length}`;
     }
-
     const result = await pool.query(query, params);
-    const row = result.rows[0];
-    res.json({
-      overall_total: parseFloat(row.overall_total),
-      overall_investment: parseFloat(row.overall_investment),
-      overall_profit: parseFloat(row.overall_profit)
-    });
+    const outstanding = parseFloat(result.rows[0].overall_outstanding);
+    // Dito natin iko‑compute ang investment (70%) at profit (30%)
+    const overall_total = outstanding;
+    const overall_investment = overall_total * 0.7;
+    const overall_profit = overall_total * 0.3;
+    res.json({ overall_total, overall_investment, overall_profit });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch totals' });
   }
@@ -825,8 +840,9 @@ app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
   if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
   try {
     const result = await pool.query(`
-      SELECT c.id, c.charge_date, c.created_at, c.total_amount,
-             COUNT(ci.id) as item_count
+      SELECT c.id, c.charge_date, c.created_at, c.total_amount, c.paid_amount,
+             COUNT(ci.id) as item_count,
+             c.total_amount - c.paid_amount as outstanding
       FROM charges c
       LEFT JOIN charge_items ci ON c.id = ci.charge_id
       WHERE c.customer_id = $1
