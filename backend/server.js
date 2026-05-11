@@ -112,6 +112,12 @@ async function initDB() {
       unit_price DECIMAL(10,2) NOT NULL,
       line_total DECIMAL(10,2) NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS charge_images (
+      id SERIAL PRIMARY KEY,
+      charge_id INTEGER REFERENCES charges(id) ON DELETE CASCADE,
+      image_data TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
   `);
 
   // Tiyakin ang paid_amount column (kung luma na ang database)
@@ -809,6 +815,14 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
     );
     const chargeId = chargeResult.rows[0].id;
     for (const ci of chargeItems) {
+      // Ipasok ang mga larawan (kung mayroon)
+      if (req.body.images && Array.isArray(req.body.images)) {
+        for (const imgBase64 of req.body.images.slice(0, 6)) {
+          if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
+            await client.query('INSERT INTO charge_images (charge_id, image_data) VALUES ($1, $2)', [chargeId, imgBase64]);
+          }
+        }
+      }
       await client.query(
         'INSERT INTO charge_items (charge_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
         [chargeId, ci.item_id, ci.quantity, ci.unit_price, ci.line_total]
@@ -821,6 +835,19 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
+  }
+});
+
+app.get('/api/charges/:id/images', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT id, image_data FROM charge_images WHERE charge_id = $1 ORDER BY id',
+      [id]
+    );
+    res.json(result.rows.map(r => ({ id: r.id, data: r.image_data })));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch charge images' });
   }
 });
 
