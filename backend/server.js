@@ -687,12 +687,11 @@ app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => 
   try {
     const result = await pool.query(`
       SELECT cust.id as customer_id, cust.name as customer_name, cust.owner,
-             COUNT(DISTINCT c.id) as charge_count,
-             COALESCE(SUM(c.total_amount), 0) as total_amount
+          COUNT(DISTINCT c.id) as charge_count,
+          COALESCE(SUM(c.total_amount), 0) as total_amount
       FROM customers cust
       LEFT JOIN charges c ON cust.id = c.customer_id
       GROUP BY cust.id, cust.name, cust.owner
-      ORDER BY cust.name
     `);
     res.json(result.rows);
   } catch (err) {
@@ -749,7 +748,7 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   try {
     let query = `
       SELECT
-        COALESCE(SUM(c.total_amount), 0) as overall_total,
+        COALESCE(SUM(ci.line_total), 0) as overall_total,
         COALESCE(SUM((ci.unit_price - i.investment) * ci.quantity), 0) as overall_profit,
         COALESCE(SUM(i.investment * ci.quantity), 0) as overall_investment
       FROM charges c
