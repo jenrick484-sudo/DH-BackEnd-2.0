@@ -840,5 +840,44 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
+// Kumuha ng pinagsamang transaksyon ng isang customer (charges + DATA sales)
+app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT
+        t.date,
+        t.type,
+        t.amount,
+        SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq) as balance
+      FROM (
+        -- Charges
+        SELECT charge_date as date, 'CH' as type, total_amount as amount,
+               total_amount as signed_amount, 1 as seq
+        FROM charges
+        WHERE customer_id = $1
+        UNION ALL
+        -- DATA sales
+        SELECT sale_date as date, 'DT' as type, total_amount as amount,
+               -total_amount as signed_amount, 2 as seq
+        FROM sales
+        WHERE customer_id = $1 AND sale_type = 'data'
+      ) t
+      ORDER BY t.date, t.seq
+    `, [id]);
+
+    // I-parse ang numeric fields para ligtas
+    const transactions = result.rows.map(row => ({
+      date: row.date,
+      type: row.type,
+      amount: parseFloat(row.amount),
+      balance: parseFloat(row.balance)
+    }));
+    res.json(transactions);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
