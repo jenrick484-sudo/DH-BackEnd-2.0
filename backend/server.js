@@ -67,6 +67,8 @@ async function initDB() {
       sale_date DATE NOT NULL DEFAULT CURRENT_DATE,
       total_amount DECIMAL(10,2) NOT NULL,
       created_by INTEGER REFERENCES users(id),
+      sale_type VARCHAR(10) DEFAULT 'cash',
+      customer_id INTEGER REFERENCES customers(id),
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS sale_items (
@@ -279,44 +281,62 @@ app.put('/api/inventory/:itemId', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- SALES ----
 app.post('/api/sales', authenticateToken, async (req, res) => {
-  const { items } = req.body;
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Items array required' });
+  const { items, sale_type, customer_id, total_amount } = req.body;
+  const type = sale_type || 'cash';
+
+  // Para sa cash sale, kailangan ng items
+  if (type === 'cash' && (!items || !Array.isArray(items) || items.length === 0)) {
+    return res.status(400).json({ error: 'Items array required for cash sale' });
   }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     let total = 0;
-    const saleItems = [];
-    for (const line of items) {
-      const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
-      if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
-      const item = itemRes.rows[0];
-      const unitPrice = line.unit_price || item.price;
-      const lineTotal = unitPrice * line.quantity;
-      total += lineTotal;
-      saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
-      const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
-      if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
-        throw new Error(`Insufficient stock for item "${item.name}"`);
+
+    if (type === 'cash') {
+      // Parehong logic tulad ng dati: inventory deduction, line items, atbp.
+      const saleItems = [];
+      for (const line of items) {
+        const itemRes = await client.query('SELECT * FROM items WHERE id = $1', [line.item_id]);
+        if (itemRes.rows.length === 0) throw new Error(`Item ${line.item_id} not found`);
+        const item = itemRes.rows[0];
+        const unitPrice = line.unit_price || item.price;
+        const lineTotal = unitPrice * line.quantity;
+        total += lineTotal;
+        saleItems.push({ item_id: item.id, quantity: line.quantity, unit_price: unitPrice, line_total: lineTotal });
+        const invRes = await client.query('SELECT quantity FROM inventory WHERE item_id = $1', [item.id]);
+        if (invRes.rows.length === 0 || invRes.rows[0].quantity < line.quantity) {
+          throw new Error(`Insufficient stock for item "${item.name}"`);
+        }
+        await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
       }
-      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE item_id = $2', [line.quantity, item.id]);
-    }
-    const saleResult = await client.query(
-      'INSERT INTO sales (total_amount, created_by) VALUES ($1, $2) RETURNING id',
-      [total, req.user.id]
-    );
-    const saleId = saleResult.rows[0].id;
-    for (const si of saleItems) {
+      // Ipasok ang sales header
+      const saleResult = await client.query(
+        `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [total, 'cash', null, req.user.id]
+      );
+      const saleId = saleResult.rows[0].id;
+      for (const si of saleItems) {
+        await client.query(
+          'INSERT INTO sale_items (sale_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
+          [saleId, si.item_id, si.quantity, si.unit_price, si.line_total]
+        );
+      }
+    } else if (type === 'data') {
+      // DATA sale: walang item, gamitin ang total_amount mula sa request
+      total = parseFloat(total_amount) || 0;
+      if (!customer_id) throw new Error('Customer ID required for DATA sale');
+      // Ipasok lang ang header
       await client.query(
-        'INSERT INTO sale_items (sale_id, item_id, quantity, unit_price, line_total) VALUES ($1, $2, $3, $4, $5)',
-        [saleId, si.item_id, si.quantity, si.unit_price, si.line_total]
+        `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4)`,
+        [total, 'data', customer_id, req.user.id]
       );
     }
+
     await client.query('COMMIT');
-    res.status(201).json({ sale_id: saleId, total_amount: total });
+    res.status(201).json({ sale_type: type, total_amount: total });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -329,6 +349,7 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT s.*, u.username,
+             cust.name as customer_name,
              COALESCE(json_agg(
                json_build_object(
                  'id', si.id,
@@ -340,9 +361,10 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
              ) FILTER (WHERE si.id IS NOT NULL), '[]') as line_items
       FROM sales s
       JOIN users u ON s.created_by = u.id
+      LEFT JOIN customers cust ON s.customer_id = cust.id
       LEFT JOIN sale_items si ON s.id = si.sale_id
       LEFT JOIN items i ON si.item_id = i.id
-      GROUP BY s.id, u.username
+      GROUP BY s.id, u.username, cust.name
       ORDER BY s.created_at DESC
     `);
     res.json(result.rows);
