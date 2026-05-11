@@ -887,19 +887,19 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
         t.date,
         t.type,
         t.amount,
-        SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq) as balance
+        SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq, t.item_id) as balance
       FROM (
         SELECT charge_date as date, 'CH' as type, total_amount as amount,
-               total_amount as signed_amount, 1 as seq
+               total_amount as signed_amount, 1 as seq, id as item_id
         FROM charges
         WHERE customer_id = $1
         UNION ALL
         SELECT sale_date as date, 'DT' as type, total_amount as amount,
-               -total_amount as signed_amount, 2 as seq
+               -total_amount as signed_amount, 2 as seq, id as item_id
         FROM sales
         WHERE customer_id = $1 AND sale_type = 'data'
       ) t
-      ORDER BY t.date, t.seq
+      ORDER BY t.date, t.seq, t.item_id
     `, [id]);
 
     const transactions = result.rows.map(row => ({
