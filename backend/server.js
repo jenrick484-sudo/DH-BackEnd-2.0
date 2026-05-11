@@ -358,9 +358,10 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         remaining -= toPay;
       }
 
+      const payment_type = req.body.payment_type || 'Cash';
       await client.query(
-        `INSERT INTO sales (total_amount, sale_type, customer_id, created_by) VALUES ($1, $2, $3, $4)`,
-        [total, 'data', customer_id, req.user.id]
+        `INSERT INTO sales (total_amount, sale_type, customer_id, created_by, payment_type) VALUES ($1, $2, $3, $4, $5)`,
+        [total, 'data', customer_id, req.user.id, payment_type]
       );
     }
 
@@ -377,7 +378,7 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
 app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT s.*, u.username,
+      SELECT s.*, u.username, cust.name as customer_name,
              cust.name as customer_name,
              COALESCE(json_agg(
                json_build_object(
@@ -957,15 +958,21 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
         t.amount,
         SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq, t.item_id) as balance
       FROM (
+        -- Charges
         SELECT charge_date as date, 'CH' as type, total_amount as amount,
                total_amount as signed_amount, 1 as seq, id as item_id
         FROM charges
         WHERE customer_id = $1
         UNION ALL
-        SELECT sale_date as date, 'DT' as type, total_amount as amount,
-               -total_amount as signed_amount, 2 as seq, id as item_id
-        FROM sales
-        WHERE customer_id = $1 AND sale_type = 'data'
+        -- DATA sales (may payment type)
+        SELECT sale_date as date,
+               'DT, ' || COALESCE(s.payment_type, 'Cash') as type,
+               s.total_amount as amount,
+               -s.total_amount as signed_amount,
+               2 as seq,
+               s.id as item_id
+        FROM sales s
+        WHERE s.customer_id = $1 AND s.sale_type = 'data'
       ) t
       ORDER BY t.date, t.seq, t.item_id
     `, [id]);
