@@ -14,7 +14,7 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// ---- MIDDLEWARE (kinukunan ang totoong user mula sa DB) ----
+// ---- MIDDLEWARE ----
 async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -114,7 +114,7 @@ async function initDB() {
     );
   `);
 
-  // Siguraduhing may paid_amount column (kung lumang database)
+  // Tiyakin ang paid_amount column (kung luma na ang database)
   await pool.query(`ALTER TABLE charges ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(10,2) DEFAULT 0`);
 
   console.log('All tables ready');
@@ -390,7 +390,20 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
       GROUP BY s.id, u.username, cust.name
       ORDER BY s.created_at DESC
     `);
-    res.json(result.rows);
+
+    const sales = result.rows.map(sale => {
+      if (sale.sale_type === 'data') {
+        const total = parseFloat(sale.total_amount);
+        return {
+          ...sale,
+          investment: total * 0.7,
+          profit: total * 0.3
+        };
+      }
+      return sale;
+    });
+
+    res.json(sales);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch sales' });
   }
@@ -469,6 +482,7 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
     if (sale_type === 'cash') {
       return res.status(400).json({ error: 'Cannot delete cash sale directly. Delete its items first.' });
     }
+    // Ibalik ang bayad? Puwede, pero sa ngayon, simpleng delete lang
     await pool.query('DELETE FROM sales WHERE id = $1', [id]);
     res.json({ message: 'Deleted' });
   } catch (err) {
@@ -476,24 +490,44 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- REPORTS ----
+// ---- REPORTS (may kasamang DATA) ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
   if (!year) return res.status(400).json({ error: 'Year required' });
   try {
     const result = await pool.query(`
-      SELECT EXTRACT(MONTH FROM s.sale_date) as month,
-             COALESCE(SUM(si.line_total), 0) as total_sales,
-             COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
-             COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
-             COUNT(DISTINCT s.id) as transaction_count
-      FROM sales s
-      JOIN sale_items si ON s.id = si.sale_id
-      JOIN items i ON si.item_id = i.id
-      WHERE EXTRACT(YEAR FROM s.sale_date) = $1
+      SELECT month,
+             SUM(total_sales) as total_sales,
+             SUM(total_investment) as total_investment,
+             SUM(total_profit) as total_profit,
+             SUM(transaction_count) as transaction_count
+      FROM (
+        -- Cash sales
+        SELECT EXTRACT(MONTH FROM s.sale_date) as month,
+               COALESCE(SUM(si.line_total), 0) as total_sales,
+               COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
+               COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
+               COUNT(DISTINCT s.id) as transaction_count
+        FROM sales s
+        JOIN sale_items si ON s.id = si.sale_id
+        JOIN items i ON si.item_id = i.id
+        WHERE s.sale_type = 'cash' AND EXTRACT(YEAR FROM s.sale_date) = $1
+        GROUP BY month
+        UNION ALL
+        -- DATA sales
+        SELECT EXTRACT(MONTH FROM s.sale_date) as month,
+               SUM(s.total_amount) as total_sales,
+               SUM(s.total_amount * 0.7) as total_investment,
+               SUM(s.total_amount * 0.3) as total_profit,
+               COUNT(s.id) as transaction_count
+        FROM sales s
+        WHERE s.sale_type = 'data' AND EXTRACT(YEAR FROM s.sale_date) = $1
+        GROUP BY month
+      ) combined
       GROUP BY month
       ORDER BY month
     `, [year]);
+
     const monthly = Array.from({ length: 12 }, (_, i) => {
       const existing = result.rows.find(r => parseInt(r.month) === i + 1);
       return {
@@ -516,18 +550,40 @@ app.get('/api/sales/report/monthly', authenticateToken, async (req, res) => {
   try {
     const daysInMonth = new Date(year, month, 0).getDate();
     const result = await pool.query(`
-      SELECT EXTRACT(DAY FROM s.sale_date) as day,
-             COALESCE(SUM(si.line_total), 0) as total_sales,
-             COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
-             COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
-             COUNT(DISTINCT s.id) as transaction_count
-      FROM sales s
-      JOIN sale_items si ON s.id = si.sale_id
-      JOIN items i ON si.item_id = i.id
-      WHERE EXTRACT(YEAR FROM s.sale_date) = $1 AND EXTRACT(MONTH FROM s.sale_date) = $2
+      SELECT day,
+             SUM(total_sales) as total_sales,
+             SUM(total_investment) as total_investment,
+             SUM(total_profit) as total_profit,
+             SUM(transaction_count) as transaction_count
+      FROM (
+        SELECT EXTRACT(DAY FROM s.sale_date) as day,
+               COALESCE(SUM(si.line_total), 0) as total_sales,
+               COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
+               COALESCE(SUM((si.unit_price - i.investment) * si.quantity), 0) as total_profit,
+               COUNT(DISTINCT s.id) as transaction_count
+        FROM sales s
+        JOIN sale_items si ON s.id = si.sale_id
+        JOIN items i ON si.item_id = i.id
+        WHERE s.sale_type = 'cash'
+          AND EXTRACT(YEAR FROM s.sale_date) = $1
+          AND EXTRACT(MONTH FROM s.sale_date) = $2
+        GROUP BY day
+        UNION ALL
+        SELECT EXTRACT(DAY FROM s.sale_date) as day,
+               SUM(s.total_amount) as total_sales,
+               SUM(s.total_amount * 0.7) as total_investment,
+               SUM(s.total_amount * 0.3) as total_profit,
+               COUNT(s.id) as transaction_count
+        FROM sales s
+        WHERE s.sale_type = 'data'
+          AND EXTRACT(YEAR FROM s.sale_date) = $1
+          AND EXTRACT(MONTH FROM s.sale_date) = $2
+        GROUP BY day
+      ) combined
       GROUP BY day
       ORDER BY day
     `, [year, month]);
+
     const daily = Array.from({ length: daysInMonth }, (_, i) => {
       const day = i + 1;
       const existing = result.rows.find(r => parseInt(r.day) === day);
@@ -550,15 +606,36 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
   if (!year || !month || !day) return res.status(400).json({ error: 'Year, month, day required' });
   try {
     const result = await pool.query(`
-      SELECT i.name as item_name, i.description, i.brand,
-             i.investment, si.quantity, si.unit_price, si.line_total,
-             (si.unit_price - i.investment) * si.quantity as profit
-      FROM sale_items si
-      JOIN sales s ON si.sale_id = s.id
-      JOIN items i ON si.item_id = i.id
-      WHERE EXTRACT(YEAR FROM s.sale_date) = $1 AND EXTRACT(MONTH FROM s.sale_date) = $2 AND EXTRACT(DAY FROM s.sale_date) = $3
-      ORDER BY s.created_at
+      SELECT item_name, description, brand, investment,
+             quantity, unit_price, line_total, profit
+      FROM (
+        SELECT i.name as item_name, i.description, i.brand,
+               i.investment, si.quantity, si.unit_price, si.line_total,
+               (si.unit_price - i.investment) * si.quantity as profit
+        FROM sale_items si
+        JOIN sales s ON si.sale_id = s.id
+        JOIN items i ON si.item_id = i.id
+        WHERE s.sale_type = 'cash'
+          AND EXTRACT(YEAR FROM s.sale_date) = $1
+          AND EXTRACT(MONTH FROM s.sale_date) = $2
+          AND EXTRACT(DAY FROM s.sale_date) = $3
+        UNION ALL
+        SELECT cust.name as item_name, NULL as description, NULL as brand,
+               s.total_amount * 0.7 as investment,
+               1 as quantity,
+               s.total_amount as unit_price,
+               s.total_amount as line_total,
+               s.total_amount * 0.3 as profit
+        FROM sales s
+        JOIN customers cust ON s.customer_id = cust.id
+        WHERE s.sale_type = 'data'
+          AND EXTRACT(YEAR FROM s.sale_date) = $1
+          AND EXTRACT(MONTH FROM s.sale_date) = $2
+          AND EXTRACT(DAY FROM s.sale_date) = $3
+      ) combined
+      ORDER BY item_name
     `, [year, month, day]);
+
     const data = result.rows.map(row => ({
       ...row,
       investment: parseFloat(row.investment) || 0,
@@ -706,41 +783,6 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/charges', authenticateToken, async (req, res) => {
-  const { customer_id, year, month, day } = req.query;
-  let where = '1=1';
-  const params = [];
-  if (customer_id) { params.push(customer_id); where += ` AND c.customer_id = $${params.length}`; }
-  if (year) { params.push(year); where += ` AND EXTRACT(YEAR FROM c.charge_date) = $${params.length}`; }
-  if (month) { params.push(month); where += ` AND EXTRACT(MONTH FROM c.charge_date) = $${params.length}`; }
-  if (day) { params.push(day); where += ` AND EXTRACT(DAY FROM c.charge_date) = $${params.length}`; }
-
-  try {
-    const result = await pool.query(`
-      SELECT c.*, cust.name as customer_name,
-             COALESCE(json_agg(
-               json_build_object(
-                 'id', ci.id,
-                 'item_name', i.name,
-                 'quantity', ci.quantity,
-                 'unit_price', ci.unit_price,
-                 'line_total', ci.line_total
-               )
-             ) FILTER (WHERE ci.id IS NOT NULL), '[]') as line_items
-      FROM charges c
-      JOIN customers cust ON c.customer_id = cust.id
-      LEFT JOIN charge_items ci ON c.id = ci.charge_id
-      LEFT JOIN items i ON ci.item_id = i.id
-      WHERE ${where}
-      GROUP BY c.id, cust.name
-      ORDER BY c.charge_date DESC
-    `, params);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch charges' });
-  }
-});
-
 app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -758,20 +800,24 @@ app.get('/api/charges/customer-summary', authenticateToken, async (req, res) => 
   }
 });
 
-app.get('/api/charges/dates', authenticateToken, async (req, res) => {
+app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
   const { customer_id } = req.query;
   if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
   try {
     const result = await pool.query(`
-      SELECT charge_date, COUNT(id) as charge_count, SUM(total_amount) as daily_total
-      FROM charges
-      WHERE customer_id = $1
-      GROUP BY charge_date
-      ORDER BY charge_date DESC
+      SELECT c.id, c.charge_date, c.created_at, c.total_amount,
+             COALESCE(c.paid_amount, 0) as paid_amount,
+             COUNT(ci.id) as item_count,
+             c.total_amount - COALESCE(c.paid_amount, 0) as outstanding
+      FROM charges c
+      LEFT JOIN charge_items ci ON c.id = ci.charge_id
+      WHERE c.customer_id = $1
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
     `, [customer_id]);
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch charge dates' });
+    res.status(500).json({ error: 'Failed to fetch charges' });
   }
 });
 
@@ -802,13 +848,12 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- TOTALS para sa toolbar (outstanding = total - paid) ----
 app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   const { customer_id, charge_id } = req.query;
   try {
     let query = `
       SELECT
-        COALESCE(SUM(c.total_amount - COALESCE(c.paid_amount, 0)), 0) as overall_total
+        COALESCE(SUM(c.total_amount - COALESCE(c.paid_amount, 0)), 0) as overall_outstanding
       FROM charges c
       WHERE 1=1
     `;
@@ -823,7 +868,7 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(query, params);
-    const outstanding = parseFloat(result.rows[0].overall_total);
+    const outstanding = parseFloat(result.rows[0].overall_outstanding);
     // 70% investment, 30% profit
     const overall_total = outstanding;
     const overall_investment = overall_total * 0.7;
@@ -834,29 +879,6 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   }
 });
 
-// --- BY CUSTOMER (listahan ng charges na may outstanding) ---
-app.get('/api/charges/by-customer', authenticateToken, async (req, res) => {
-  const { customer_id } = req.query;
-  if (!customer_id) return res.status(400).json({ error: 'Customer ID required' });
-  try {
-    const result = await pool.query(`
-      SELECT c.id, c.charge_date, c.created_at, c.total_amount,
-             COALESCE(c.paid_amount, 0) as paid_amount,
-             COUNT(ci.id) as item_count,
-             c.total_amount - COALESCE(c.paid_amount, 0) as outstanding
-      FROM charges c
-      LEFT JOIN charge_items ci ON c.id = ci.charge_id
-      WHERE c.customer_id = $1
-      GROUP BY c.id
-      ORDER BY c.created_at DESC
-    `, [customer_id]);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch charges' });
-  }
-});
-
-// --- TRANSACTION HISTORY (passbook) ---
 app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -867,13 +889,11 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
         t.amount,
         SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq) as balance
       FROM (
-        -- Charges
         SELECT charge_date as date, 'CH' as type, total_amount as amount,
                total_amount as signed_amount, 1 as seq
         FROM charges
         WHERE customer_id = $1
         UNION ALL
-        -- DATA sales
         SELECT sale_date as date, 'DT' as type, total_amount as amount,
                -total_amount as signed_amount, 2 as seq
         FROM sales
