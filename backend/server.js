@@ -745,8 +745,9 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/charges/totals', authenticateToken, async (req, res) => {
+  const { customer_id, charge_id } = req.query;
   try {
-    const result = await pool.query(`
+    let query = `
       SELECT
         COALESCE(SUM(c.total_amount), 0) as overall_total,
         COALESCE(SUM((ci.unit_price - i.investment) * ci.quantity), 0) as overall_profit,
@@ -754,7 +755,20 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
       FROM charges c
       JOIN charge_items ci ON c.id = ci.charge_id
       JOIN items i ON ci.item_id = i.id
-    `);
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (customer_id) {
+      params.push(customer_id);
+      query += ` AND c.customer_id = $${params.length}`;
+    }
+    if (charge_id) {
+      params.push(charge_id);
+      query += ` AND c.id = $${params.length}`;
+    }
+
+    const result = await pool.query(query, params);
     const row = result.rows[0];
     res.json({
       overall_total: parseFloat(row.overall_total),
