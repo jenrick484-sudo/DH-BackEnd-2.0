@@ -744,12 +744,25 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/charges/total', authenticateToken, async (req, res) => {
+app.get('/api/charges/totals', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT COALESCE(SUM(total_amount), 0) as overall_total FROM charges`);
-    res.json({ overall_total: parseFloat(result.rows[0].overall_total) });
+    const result = await pool.query(`
+      SELECT
+        COALESCE(SUM(c.total_amount), 0) as overall_total,
+        COALESCE(SUM((ci.unit_price - i.investment) * ci.quantity), 0) as overall_profit,
+        COALESCE(SUM(i.investment * ci.quantity), 0) as overall_investment
+      FROM charges c
+      JOIN charge_items ci ON c.id = ci.charge_id
+      JOIN items i ON ci.item_id = i.id
+    `);
+    const row = result.rows[0];
+    res.json({
+      overall_total: parseFloat(row.overall_total),
+      overall_investment: parseFloat(row.overall_investment),
+      overall_profit: parseFloat(row.overall_profit)
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch total charges' });
+    res.status(500).json({ error: 'Failed to fetch totals' });
   }
 });
 
