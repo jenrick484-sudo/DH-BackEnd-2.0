@@ -118,6 +118,10 @@ async function initDB() {
       image_data TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS suppliers (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) UNIQUE NOT NULL
+    );
   `);
 
   // Tiyakin ang paid_amount column (kung luma na ang database)
@@ -258,6 +262,30 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
     res.json(item);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch item' });
+  }
+});
+
+//supliers
+app.get('/api/suppliers', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, name FROM suppliers ORDER BY id');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch suppliers' });
+  }
+});
+
+app.post('/api/suppliers', authenticateToken, async (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO suppliers (name) VALUES ($1) RETURNING *',
+      [name]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Supplier might already exist' });
   }
 });
 
