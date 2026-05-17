@@ -49,7 +49,8 @@ async function initDB() {
       price DECIMAL(10,2) NOT NULL,
       part_number VARCHAR(100),
       oem_number VARCHAR(100),
-      created_at TIMESTAMP DEFAULT NOW()
+      created_at TIMESTAMP DEFAULT NOW(),
+      branches TEXT
     );
     CREATE TABLE IF NOT EXISTS inventory (
       item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
@@ -181,15 +182,15 @@ app.get('/api/items', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/items', authenticateToken, async (req, res) => {
-  const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images } = req.body;
+  const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images, branches } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const itemResult = await client.query(
-      `INSERT INTO items (name, description, brand, investment, price, part_number, oem_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [name, description, brand, investment, price, part_number, oem_number]
+       `INSERT INTO items (name, description, brand, investment, price, part_number, oem_number, branches)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+       [name, description, brand, investment, price, part_number, oem_number, branches || '']
     );
     const newItem = itemResult.rows[0];
     await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
@@ -217,10 +218,10 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
     await client.query(
-      `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7
-       WHERE id=$8`,
-      [name, description, brand, investment, price, part_number, oem_number, id]
-    );
+      `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7, branches=$8
+       WHERE id=$9`,
+        [name, description, brand, investment, price, part_number, oem_number, branches, id]
+      );
     await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
     await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
     if (images && Array.isArray(images)) {
