@@ -19,7 +19,6 @@ async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.sendStatus(401);
-
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const userResult = await pool.query('SELECT id, username FROM users WHERE id = $1', [decoded.id]);
@@ -32,7 +31,7 @@ async function authenticateToken(req, res, next) {
   }
 }
 
-// ---- INIT DB ----
+// ---- INIT DB (kasama ang branches) ----
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -70,7 +69,8 @@ async function initDB() {
       created_by INTEGER REFERENCES users(id),
       sale_type VARCHAR(10) DEFAULT 'cash',
       customer_id INTEGER REFERENCES customers(id),
-      created_at TIMESTAMP DEFAULT NOW()
+      created_at TIMESTAMP DEFAULT NOW(),
+      payment_type VARCHAR(50)
     );
     CREATE TABLE IF NOT EXISTS sale_items (
       id SERIAL PRIMARY KEY,
@@ -125,9 +125,8 @@ async function initDB() {
     );
   `);
 
-  // Tiyakin ang paid_amount column (kung luma na ang database)
   await pool.query(`ALTER TABLE charges ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(10,2) DEFAULT 0`);
-
+  await pool.query(`ALTER TABLE sales ADD COLUMN IF NOT EXISTS payment_type VARCHAR(50)`);
   console.log('All tables ready');
 }
 initDB();
@@ -151,22 +150,16 @@ app.post('/api/login', async (req, res) => {
     const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '1d' }
-    );
+    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '1d' });
     res.json({ token, user: { id: user.id, username: user.username } });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ---- ITEMS ----
+// ---- ITEMS ROUTES (may branches) ----
 app.get('/api/items', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -187,11 +180,10 @@ app.post('/api/items', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const itemResult = await client.query(
-       `INSERT INTO items (name, description, brand, investment, price, part_number, oem_number, branches)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-       [name, description, brand, investment, price, part_number, oem_number, branches || '']
-    );
+    const itemResult = await client.query(`
+      INSERT INTO items (name, description, brand, investment, price, part_number, oem_number, branches)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+    `, [name, description, brand, investment, price, part_number, oem_number, branches || '']);
     const newItem = itemResult.rows[0];
     await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
     if (images && Array.isArray(images)) {
@@ -213,15 +205,14 @@ app.post('/api/items', authenticateToken, async (req, res) => {
 
 app.put('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { name, description, brand, investment, price, part_number, oem_number, stock, images } = req.body;
+  const { name, description, brand, investment, price, part_number, oem_number, stock, images, branches } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
-      `UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7, branches=$8
-       WHERE id=$9`,
-        [name, description, brand, investment, price, part_number, oem_number, branches, id]
-      );
+    await client.query(`
+      UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7, branches=$8
+      WHERE id=$9
+    `, [name, description, brand, investment, price, part_number, oem_number, branches || '', id]);
     await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
     await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
     if (images && Array.isArray(images)) {
@@ -234,8 +225,7 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
     await client.query('COMMIT');
     const updated = await pool.query(`
       SELECT i.*, COALESCE(inv.quantity, 0) as stock
-      FROM items i
-      LEFT JOIN inventory inv ON i.id = inv.item_id
+      FROM items i LEFT JOIN inventory inv ON i.id = inv.item_id
       WHERE i.id = $1
     `, [id]);
     res.json(updated.rows[0]);
@@ -252,8 +242,7 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
   try {
     const itemResult = await pool.query(`
       SELECT i.*, COALESCE(inv.quantity, 0) as stock
-      FROM items i
-      LEFT JOIN inventory inv ON i.id = inv.item_id
+      FROM items i LEFT JOIN inventory inv ON i.id = inv.item_id
       WHERE i.id = $1
     `, [id]);
     if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
@@ -266,7 +255,7 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
   }
 });
 
-//supliers
+// ---- SUPPLIERS ----
 app.get('/api/suppliers', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, name FROM suppliers ORDER BY id');
@@ -280,10 +269,7 @@ app.post('/api/suppliers', authenticateToken, async (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   try {
-    const result = await pool.query(
-      'INSERT INTO suppliers (name) VALUES ($1) RETURNING *',
-      [name]
-    );
+    const result = await pool.query('INSERT INTO suppliers (name) VALUES ($1) RETURNING *', [name]);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Supplier might already exist' });
