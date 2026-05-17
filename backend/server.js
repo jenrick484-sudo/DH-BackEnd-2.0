@@ -127,6 +127,10 @@ async function initDB() {
 
   await pool.query(`ALTER TABLE charges ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(10,2) DEFAULT 0`);
   await pool.query(`ALTER TABLE sales ADD COLUMN IF NOT EXISTS payment_type VARCHAR(50)`);
+  
+  // Tiyakin natin na may sub_brand / branch tracking support ang items column structures
+  await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS branches TEXT`);
+  
   console.log('All tables ready');
 }
 initDB();
@@ -159,13 +163,12 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ---- ITEMS ROUTES (may branches) ----
+// ---- ITEMS ROUTES (FIXED BRAND ALIGNMENT) ----
 app.get('/api/items', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT i.*, COALESCE(inv.quantity, 0) as stock
-      FROM items i
-      LEFT JOIN inventory inv ON i.id = inv.item_id
+      FROM items i LEFT JOIN inventory inv ON i.id = inv.item_id
       ORDER BY i.name
     `);
     res.json(result.rows);
@@ -175,21 +178,27 @@ app.get('/api/items', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/items', authenticateToken, async (req, res) => {
+  // Kunin nang maayos ang branches / sub-brand dynamic parameters mula sa client
   const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images, branches } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
+  
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
+    // Malinis na itatabi ang kung anong brand o variant structure ang binuo sa client payload
     const itemResult = await client.query(`
       INSERT INTO items (name, description, brand, investment, price, part_number, oem_number, branches)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
     `, [name, description, brand, investment, price, part_number, oem_number, branches || '']);
+    
     const newItem = itemResult.rows[0];
     await client.query('INSERT INTO inventory (item_id, quantity) VALUES ($1, $2)', [newItem.id, initial_stock || 0]);
+    
     if (images && Array.isArray(images)) {
-      for (const imgBase64 of images.slice(0, 6)) {
-        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
-          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [newItem.id, imgBase64]);
+      for (const img of images.slice(0, 6)) {
+        if (img && typeof img === 'string' && img.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [newItem.id, img]);
         }
       }
     }
@@ -197,10 +206,9 @@ app.post('/api/items', authenticateToken, async (req, res) => {
     res.status(201).json({ ...newItem, stock: initial_stock || 0, images: [] });
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error('Error adding item:', err);
     res.status(500).json({ error: 'Failed to add item' });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 app.put('/api/items/:id', authenticateToken, async (req, res) => {
@@ -213,12 +221,14 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
       UPDATE items SET name=$1, description=$2, brand=$3, investment=$4, price=$5, part_number=$6, oem_number=$7, branches=$8
       WHERE id=$9
     `, [name, description, brand, investment, price, part_number, oem_number, branches || '', id]);
+    
     await client.query('UPDATE inventory SET quantity = $1, updated_at = NOW() WHERE item_id = $2', [stock, id]);
     await client.query('DELETE FROM item_images WHERE item_id = $1', [id]);
+    
     if (images && Array.isArray(images)) {
-      for (const imgBase64 of images.slice(0, 6)) {
-        if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
-          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [id, imgBase64]);
+      for (const img of images.slice(0, 6)) {
+        if (img && typeof img === 'string' && img.startsWith('data:image')) {
+          await client.query('INSERT INTO item_images (item_id, image_data) VALUES ($1, $2)', [id, img]);
         }
       }
     }
@@ -232,11 +242,10 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: 'Failed to update item' });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
+// CRITICAL FIX FOR VIEW ITEM BRAND CONFUSION
 app.get('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -245,10 +254,14 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
       FROM items i LEFT JOIN inventory inv ON i.id = inv.item_id
       WHERE i.id = $1
     `, [id]);
+    
     if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
     const item = itemResult.rows[0];
+    
     const imagesResult = await pool.query('SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id', [id]);
     item.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
+    
+    // Ipadala pabalik ang item object kasama ang original saved layout elements nito nang malinis
     res.json(item);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch item' });
@@ -264,7 +277,6 @@ app.get('/api/suppliers', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch suppliers' });
   }
 });
-
 app.post('/api/suppliers', authenticateToken, async (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
@@ -349,7 +361,6 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         );
       }
     } else if (type === 'data') {
-      // DATA sale: ipamahagi ang bayad sa mga unpaid charges (FIFO)
       if (!customer_id) throw new Error('Customer ID required for DATA sale');
       total = parseFloat(total_amount) || 0;
       let remaining = total;
@@ -394,7 +405,6 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT s.*, u.username, cust.name as customer_name,
-             cust.name as customer_name,
              COALESCE(json_agg(
                json_build_object(
                  'id', si.id,
@@ -501,7 +511,6 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Kunin ang sale
     const sale = await client.query('SELECT * FROM sales WHERE id = $1', [id]);
     if (sale.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -515,11 +524,9 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Cannot delete cash sale directly. Delete its items first.' });
     }
 
-    // --- DATA sale: ibalik ang bayad sa mga charges (reverse FIFO) ---
     if (sale_type === 'data') {
       let remaining = parseFloat(total_amount);
 
-      // Kunin ang charges na may paid_amount > 0, simula sa pinakahuli
       const paidCharges = await client.query(
         `SELECT id, COALESCE(paid_amount, 0) as paid_amount
          FROM charges
@@ -540,9 +547,7 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Burahin ang sales record
     await client.query('DELETE FROM sales WHERE id = $1', [id]);
-
     await client.query('COMMIT');
     res.json({ message: 'Deleted' });
   } catch (err) {
@@ -553,7 +558,7 @@ app.delete('/api/sales/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ---- REPORTS (may kasamang DATA) ----
+// ---- REPORTS ----
 app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
   const { year } = req.query;
   if (!year) return res.status(400).json({ error: 'Year required' });
@@ -565,7 +570,6 @@ app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
              SUM(total_profit) as total_profit,
              SUM(transaction_count) as transaction_count
       FROM (
-        -- Cash sales
         SELECT EXTRACT(MONTH FROM s.sale_date) as month,
                COALESCE(SUM(si.line_total), 0) as total_sales,
                COALESCE(SUM(i.investment * si.quantity), 0) as total_investment,
@@ -577,7 +581,6 @@ app.get('/api/sales/report/yearly', authenticateToken, async (req, res) => {
         WHERE s.sale_type = 'cash' AND EXTRACT(YEAR FROM s.sale_date) = $1
         GROUP BY month
         UNION ALL
-        -- DATA sales
         SELECT EXTRACT(MONTH FROM s.sale_date) as month,
                SUM(s.total_amount) as total_sales,
                SUM(s.total_amount * 0.7) as total_investment,
@@ -831,7 +834,6 @@ app.post('/api/charges', authenticateToken, async (req, res) => {
     );
     const chargeId = chargeResult.rows[0].id;
     for (const ci of chargeItems) {
-      // Ipasok ang mga larawan (kung mayroon)
       if (req.body.images && Array.isArray(req.body.images)) {
         for (const imgBase64 of req.body.images.slice(0, 6)) {
           if (imgBase64 && typeof imgBase64 === 'string' && imgBase64.startsWith('data:image')) {
@@ -953,7 +955,6 @@ app.get('/api/charges/totals', authenticateToken, async (req, res) => {
 
     const result = await pool.query(query, params);
     const outstanding = parseFloat(result.rows[0].overall_outstanding);
-    // 70% investment, 30% profit
     const overall_total = outstanding;
     const overall_investment = overall_total * 0.7;
     const overall_profit = overall_total * 0.3;
@@ -973,13 +974,11 @@ app.get('/api/customers/:id/transactions', authenticateToken, async (req, res) =
         t.amount,
         SUM(t.signed_amount) OVER (ORDER BY t.date, t.seq, t.item_id) as balance
       FROM (
-        -- Charges
         SELECT charge_date as date, 'CH' as type, total_amount as amount,
                total_amount as signed_amount, 1 as seq, id as item_id
         FROM charges
         WHERE customer_id = $1
         UNION ALL
-        -- DATA sales (may payment type)
         SELECT sale_date as date,
                'DT, ' || COALESCE(s.payment_type, 'Cash') as type,
                s.total_amount as amount,
