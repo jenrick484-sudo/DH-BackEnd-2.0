@@ -127,8 +127,6 @@ async function initDB() {
 
   await pool.query(`ALTER TABLE charges ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(10,2) DEFAULT 0`);
   await pool.query(`ALTER TABLE sales ADD COLUMN IF NOT EXISTS payment_type VARCHAR(50)`);
-  
-  // Tiyakin natin na may sub_brand / branch tracking support ang items column structures
   await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS branches TEXT`);
   
   console.log('All tables ready');
@@ -163,7 +161,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ---- ITEMS ROUTES (FIXED BRAND ALIGNMENT) ----
+// ---- ITEMS ROUTES ----
 app.get('/api/items', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -178,7 +176,6 @@ app.get('/api/items', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/items', authenticateToken, async (req, res) => {
-  // Kunin nang maayos ang branches / sub-brand dynamic parameters mula sa client
   const { name, description, brand, investment, price, part_number, oem_number, initial_stock, images, branches } = req.body;
   if (!name || !price) return res.status(400).json({ error: 'Name and price required' });
   
@@ -186,7 +183,6 @@ app.post('/api/items', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Malinis na itatabi ang kung anong brand o variant structure ang binuo sa client payload
     const itemResult = await client.query(`
       INSERT INTO items (name, description, brand, investment, price, part_number, oem_number, branches)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
@@ -245,7 +241,6 @@ app.put('/api/items/:id', authenticateToken, async (req, res) => {
   } finally { client.release(); }
 });
 
-// CRITICAL FIX FOR VIEW ITEM BRAND CONFUSION
 app.get('/api/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -261,7 +256,6 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
     const imagesResult = await pool.query('SELECT id, image_data FROM item_images WHERE item_id = $1 ORDER BY id', [id]);
     item.images = imagesResult.rows.map(r => ({ id: r.id, data: r.image_data }));
     
-    // Ipadala pabalik ang item object kasama ang original saved layout elements nito nang malinis
     res.json(item);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch item' });
@@ -299,7 +293,7 @@ app.get('/api/inventory', authenticateToken, async (req, res) => {
         i.investment, 
         i.price,
         i.part_number, 
-        i.oem_number,      -- Ito ang supplier value/code mo sa database
+        i.oem_number,
         i.branches,
         CASE 
           WHEN i.branches IS NULL OR TRIM(i.branches) = '' THEN i.brand
@@ -689,7 +683,8 @@ app.get('/api/sales/report/daily', authenticateToken, async (req, res) => {
       SELECT item_name, description, brand, investment,
              quantity, unit_price, line_total, profit
       FROM (
-        SELECT i.name as item_name, i.description, i.brand,
+        SELECT i.name as item_name, i.description,
+               CASE WHEN i.branches IS NULL OR TRIM(i.branches) = '' THEN i.brand ELSE i.branches END AS brand,
                i.investment, si.quantity, si.unit_price, si.line_total,
                (si.unit_price - i.investment) * si.quantity as profit
         FROM sale_items si
@@ -926,7 +921,9 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
   if (!charge_id) return res.status(400).json({ error: 'Charge ID required' });
   try {
     const result = await pool.query(`
-      SELECT i.name as item_name, i.description, i.brand, i.investment,
+      SELECT i.name as item_name, i.description,
+             CASE WHEN i.branches IS NULL OR TRIM(i.branches) = '' THEN i.brand ELSE i.branches END AS brand,
+             i.investment,
              ci.quantity, ci.unit_price, ci.line_total,
              (ci.unit_price - i.investment) * ci.quantity as profit
       FROM charge_items ci
@@ -934,6 +931,7 @@ app.get('/api/charges/items', authenticateToken, async (req, res) => {
       WHERE ci.charge_id = $1
       ORDER BY ci.id
     `, [charge_id]);
+
     const data = result.rows.map(row => ({
       ...row,
       investment: parseFloat(row.investment) || 0,
