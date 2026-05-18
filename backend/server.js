@@ -291,7 +291,6 @@ app.post('/api/suppliers', authenticateToken, async (req, res) => {
 // ---- INVENTORY ----
 app.get('/api/inventory', authenticateToken, async (req, res) => {
   try {
-    // Binago ang query para sundin ang logic: branches muna bago brand
     const result = await pool.query(`
       SELECT 
         i.id, 
@@ -300,12 +299,12 @@ app.get('/api/inventory', authenticateToken, async (req, res) => {
         i.investment, 
         i.price,
         i.part_number, 
-        i.oem_number, 
-        i.branches,  -- Isinama para sa reference ng frontend
+        i.oem_number,      -- Ito ang supplier value/code mo sa database
+        i.branches,
         CASE 
           WHEN i.branches IS NULL OR TRIM(i.branches) = '' THEN i.brand
           ELSE i.branches 
-        END AS brand, -- Ito ang magiging 'brand' na ipapakita sa UI
+        END AS brand,
         COALESCE(inv.quantity, 0) as stock
       FROM items i
       LEFT JOIN inventory inv ON i.id = inv.item_id
@@ -313,7 +312,7 @@ app.get('/api/inventory', authenticateToken, async (req, res) => {
     `);
     res.json(result.rows);
   } catch (err) {
-    console.error(err); // Maganda itong i-log para sa debugging
+    console.error(err);
     res.status(500).json({ error: 'Failed to fetch inventory' });
   }
 });
