@@ -269,11 +269,20 @@ app.get('/api/items/:id', authenticateToken, async (req, res) => {
 });
 
 // ---- SUPPLIERS ----
+// ---- GET EXISTING SUPPLIERS ----
 app.get('/api/suppliers', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name FROM suppliers ORDER BY id');
-    res.json(result.rows);
+    const result = await pool.query(`
+      SELECT DISTINCT oem_number 
+      FROM items 
+      WHERE oem_number IS NOT NULL AND TRIM(oem_number) != ''
+      ORDER BY oem_number ASC
+    `);
+    // I-extract ang mga pangalan ng supplier para maging array ng strings
+    const suppliers = result.rows.map(row => row.oem_number);
+    res.json(suppliers);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Failed to fetch suppliers' });
   }
 });
